@@ -1,0 +1,106 @@
+
+[identity]
+initial_ids = ["default_voice"]
+pending_ids = ["default_voice"]
+mandatory_ids = ["default_cw"]
+ct_message = "yellow_jacket"
+timeout_message = "timeout_warn"
+
+[timers]
+tail = 2.5
+hang = 5.0
+kerchunk = 0.0
+timeout = 180.0
+id_interval = 600.0
+id_pending = 60.0
+
+[audio]
+morse_wpm = 20
+morse_pitch = 700
+morse_volume = 90
+voice_volume = 90
+repeat_gain = 1.0
+voice_blocks_repeat = false
+sample_rate = 16000
+
+[hardware]
+mock = false
+ptt_gpio = 17
+cos_gpio = 27
+cos_invert = true
+
+[ctcss]
+mode = "ste reverse_burst"
+access_mode = "cos_ctcss"
+encode_freq = 91.5
+decode_freq = 91.5
+encode_level = 0.15
+ste_mode = "reverse"
+chicken_burst_ms = 200
+reverse_burst_ms = 250
+decode_time_ms = 250
+decode_threshold = 0.015
+decode_hold_ms = 500
+
+[courtesy_tones.default]
+elements = [[1000, 0, 50, 0.8], [0, 0, 30, 0.0], [1200, 0, 50, 0.8]]
+
+[courtesy_tones.single]
+elements = [[1000, 0, 80, 0.8]]
+
+[courtesy_tones.triple]
+elements = [[800, 0, 40, 0.8], [0, 0, 20, 0.0], [1000, 0, 40, 0.8], [0, 0, 20, 0.0], [1200, 0, 40, 0.8]]
+
+[courtesy_tones.K]
+elements = [[700, 0, 180, 0.8], [0, 0, 60, 0.0], [700, 0, 60, 0.8], [0, 0, 60, 0.0], [700, 0, 180, 0.8]]
+
+[courtesy_tones.chord]
+elements = [[697, 1209, 150, 0.75]]
+
+[courtesy_tones.timeout_warn]
+elements = [[1200, 0, 60, 0.9], [0, 0, 20, 0.0], [1000, 0, 60, 0.9], [0, 0, 20, 0.0], [800, 0, 60, 0.9]]
+
+[courtesy_tones.id_pending]
+elements = [[880, 0, 60, 0.6], [0, 0, 30, 0.0], [880, 0, 60, 0.6]]
+
+[messages.default_cw]
+elements = [{type = "cw", text = "WA0EDA/R"}]
+
+[messages.timeout_warn]
+elements = [{type = "tone", freq1 = 1200, freq2 = 0, ms = 60, amp = 0.9}, {type = "tone", freq1 = 0, freq2 = 0, ms = 20, amp = 0.0}, {type = "tone", freq1 = 1000, freq2 = 0, ms = 60, amp = 0.9}, {type = "tone", freq1 = 0, freq2 = 0, ms = 20, amp = 0.0}, {type = "tone", freq1 = 800, freq2 = 0, ms = 60, amp = 0.9}]
+
+[messages.default_voice]
+elements = [{type = "voice", clip = "THIS"}, {type = "voice", clip = "IS"}, {type = "voice", clip = "W"}, {type = "voice", clip = "A"}, {type = "voice", clip = "ZERO"}, {type = "voice", clip = "E"}, {type = "voice", clip = "D"}, {type = "voice", clip = "A"}, {type = "voice", clip = "REPEATER"}]
+
+[messages.bumble_bee]
+elements = [{type = "tone", freq1 = 330.0, freq2 = 0.0, ms = 100, amp = 0.7}, {type = "tone", freq1 = 495.0, freq2 = 0.0, ms = 100, amp = 0.7}, {type = "tone", freq1 = 660.0, freq2 = 0.0, ms = 100, amp = 0.7}]
+
+[messages.piano_chord]
+elements = [{type = "tone", freq1 = 660.0, freq2 = 880.0, ms = 100, amp = 0.7}]
+
+[messages.yellow_jacket]
+elements = [{type = "tone", freq1 = 330.0, freq2 = 0.0, ms = 50, amp = 0.7}, {type = "tone", freq1 = 495.0, freq2 = 0.0, ms = 50, amp = 0.7}, {type = "tone", freq1 = 660.0, freq2 = 0.0, ms = 50, amp = 0.7}]
+
+[messages.shooting_star]
+elements = [{type = "tone", freq1 = 800.0, freq2 = 0.0, ms = 100, amp = 0.7}, {type = "tone", freq1 = 800.0, freq2 = 0.0, ms = 100, amp = 0.7}, {type = "tone", freq1 = 540.0, freq2 = 0.0, ms = 100, amp = 0.7}]
+
+[messages.stardust]
+elements = [{type = "tone", freq1 = 750.0, freq2 = 0.0, ms = 125, amp = 0.7}, {type = "tone", freq1 = 880.0, freq2 = 0.0, ms = 80, amp = 0.7}, {type = "tone", freq1 = 880.0, freq2 = 1200.0, ms = 80, amp = 0.7}]
+
+[messages.hornet]
+elements = [{type = "tone", freq1 = 660.0, freq2 = 0.0, ms = 50, amp = 0.7}, {type = "tone", freq1 = 500.0, freq2 = 0.0, ms = 50, amp = 0.7}, {type = "tone", freq1 = 385.0, freq2 = 0.0, ms = 50, amp = 0.7}]
+
+[messages.chirp_chomp]
+elements = [{type = "tone", freq1 = 1500.0, freq2 = 0.0, ms = 20, amp = 0.7}, {type = "tone", freq1 = 1250.0, freq2 = 0.0, ms = 20, amp = 0.7}, {type = "tone", freq1 = 1000.0, freq2 = 0.0, ms = 20, amp = 0.7}, {type = "tone", freq1 = 750.0, freq2 = 0.0, ms = 20, amp = 0.7}, {type = "tone", freq1 = 500.0, freq2 = 0.0, ms = 20, amp = 0.7}, {type = "tone", freq1 = 2550.0, freq2 = 0.0, ms = 20, amp = 0.7}]
+
+[messages.quidar_low]
+elements = [{type = "tone", freq1 = 2475.0, freq2 = 0.0, ms = 250, amp = 0.7}]
+
+[messages.quidar_high]
+elements = [{type = "tone", freq1 = 2525.0, freq2 = 0.0, ms = 250, amp = 0.7}]
+
+[messages.gmrs]
+elements = [{type = "voice", clip = "THIS"}, {type = "voice", clip = "IS"}, {type = "voice", clip = "W"}, {type = "voice", clip = "Q"}, {type = "voice", clip = "I"}, {type = "voice", clip = "U"}, {type = "voice", clip = "SEVEN"}, {type = "voice", clip = "SIX"}, {type = "voice", clip = "FIVE"}, {type = "voice", clip = "G"}, {type = "voice", clip = "M"}, {type = "voice", clip = "R"}, {type = "voice", clip = "S"}, {type = "voice", clip = "REPEATER"}]
+
+[messages.gmrs_hello]
+elements = [{type = "voice", clip = "WELCOME"}, {type = "voice", clip = "TO"}, {type = "voice", clip = "THE"}, {type = "voice", clip = "L"}, {type = "voice", clip = "F"}, {type = "voice", clip = "K"}, {type = "voice", clip = "G"}, {type = "voice", clip = "M"}, {type = "voice", clip = "R"}, {type = "voice", clip = "S"}, {type = "voice", clip = "OPEN"}, {type = "voice", clip = "REPEATER"}, {type = "voice", clip = "PAUSE_"}, {type = "voice", clip = "W"}, {type = "voice", clip = "Q"}, {type = "voice", clip = "I"}, {type = "voice", clip = "U"}, {type = "voice", clip = "SEVEN"}, {type = "voice", clip = "SIX"}, {type = "voice", clip = "FIVE"}]
