@@ -1,0 +1,5 @@
+# C-Media CM108/CM119/CM119B USB audio/GPIO device
+# Grants read/write access to hidraw interface for users in the 'audio' group.
+# Install: sudo cp 99-cm119.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0d8c", GROUP="audio", MODE="0660"

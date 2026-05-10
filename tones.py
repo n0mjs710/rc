@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 44100   # default for CLI playback
 ATTACK_S    = 0.005   # 5 ms raised-cosine attack/decay (click-free keying)
 
 
@@ -100,9 +100,10 @@ BUILTIN_TONES: dict[str, list] = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_element(freq1: float, freq2: float,
-                  duration_ms: int, amplitude: float) -> np.ndarray:
-    """Render one tone element to a float32 array at SAMPLE_RATE."""
-    n = max(1, int(duration_ms / 1000.0 * SAMPLE_RATE))
+                  duration_ms: int, amplitude: float,
+                  sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Render one tone element to a float32 array at the given sample rate."""
+    n = max(1, int(duration_ms / 1000.0 * sample_rate))
 
     if freq1 <= 0 and freq2 <= 0:
         return np.zeros(n, dtype=np.float32)
@@ -123,7 +124,7 @@ def _make_element(freq1: float, freq2: float,
         wave /= active
 
     # Raised-cosine attack/decay to eliminate key clicks
-    ramp_n = min(int(ATTACK_S * SAMPLE_RATE), n // 2)
+    ramp_n = min(int(ATTACK_S * sample_rate), n // 2)
     if ramp_n > 0:
         ramp = np.hanning(ramp_n * 2)
         wave[:ramp_n]  *= ramp[:ramp_n]
@@ -132,16 +133,19 @@ def _make_element(freq1: float, freq2: float,
     return (wave * float(amplitude)).astype(np.float32)
 
 
-def render_tone(elements: list) -> np.ndarray:
+def render_tone(elements: list, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     """
-    Render a named tone's element list to a float32 numpy array at SAMPLE_RATE.
+    Render a tone element list to a float32 numpy array.
+
     elements: list of [freq1_hz, freq2_hz, duration_ms, amplitude]
+    sample_rate: output sample rate (default: SAMPLE_RATE for CLI playback;
+                 pass cfg.audio.sample_rate when feeding the audio engine)
     """
     if not elements:
         return np.array([], dtype=np.float32)
 
     chunks = [
-        _make_element(float(e[0]), float(e[1]), int(e[2]), float(e[3]))
+        _make_element(float(e[0]), float(e[1]), int(e[2]), float(e[3]), sample_rate)
         for e in elements
     ]
     return np.concatenate(chunks)

@@ -1,287 +1,189 @@
 """
-GPIO abstraction layer for the repeater controller.
+CM119 USB audio/GPIO hardware driver.
 
-Two implementations are provided:
+Supports CM108/CM119/CM119B USB audio devices (Masters Communications,
+RepeaterBuilder, DMK URIx, and similar).  All share the same HID signal
+mapping (AllStar chan_usbradio convention):
 
-  MockHardware  — pure Python, no GPIO dependency.  Logs all pin changes to
-                  a list so the simulator / test suite can inspect them.
-                  Runs on any machine.
+  HID input  byte 0 bit 0  — Vol-Down → COR   (set = carrier present)
+  HID input  byte 0 bit 1  — Vol-Up   → CTCSS  (set = tone present)
+  HID output GPIO3 bit 2   — PTT output        (set = TX active)
 
-  RealHardware  — thin wrapper around RPi.GPIO.  Only importable on a
-                  Raspberry Pi; raises ImportError otherwise.
+The reader thread blocks on hid.read() with a short timeout so close() is
+responsive.  Callbacks fire edge-triggered (on state change) from that thread;
+they must be fast and non-blocking.
 
-Usage:
-    from hardware import get_hardware
-    hw = get_hardware(mock=cfg.hardware.mock)
-    hw.setup(ptt_gpio=17, cos_gpio=27, cos_invert=False)
-    hw.set_ptt(True)
-    cos_state = hw.get_cos()
-    hw.cleanup()
-
-Both classes implement the HardwareBase interface; the controller only
-depends on that, making it straightforward to add new back-ends.
+Requirements:
+  pip install hidapi
+  sudo apt install libhidapi-hidraw0
+  udev/99-cm119.rules installed (see repo)
 """
 
 from __future__ import annotations
 import threading
-from abc import ABC, abstractmethod
 from typing import Callable
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Abstract interface
-# ─────────────────────────────────────────────────────────────────────────────
-
-class HardwareBase(ABC):
+class CM119Hardware:
     """
-    Minimal GPIO abstraction required by the repeater controller.
+    CM108/CM119-family USB HID driver.
 
-    All methods are thread-safe.  Callbacks registered with
-    add_cos_callback() are called from a background thread whenever the
-    COS input changes state; the argument is the new boolean value
-    (True = carrier present).
-    """
-
-    @abstractmethod
-    def setup(self, ptt_gpio: int, cos_gpio: int,
-              cos_invert: bool = False) -> None:
-        """Configure GPIO pins.  Call once before any other method."""
-
-    @abstractmethod
-    def set_ptt(self, active: bool) -> None:
-        """Drive the PTT output pin high (active=True) or low."""
-
-    @abstractmethod
-    def get_cos(self) -> bool:
-        """Return the current COS input state (True = carrier present)."""
-
-    @abstractmethod
-    def add_cos_callback(self, cb: Callable[[bool], None]) -> None:
-        """Register a callback invoked on every COS edge."""
-
-    @abstractmethod
-    def remove_cos_callback(self, cb: Callable[[bool], None]) -> None:
-        """Unregister a previously added COS callback."""
-
-    @abstractmethod
-    def cleanup(self) -> None:
-        """Release GPIO resources.  Call on shutdown."""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Mock implementation
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MockHardware(HardwareBase):
-    """
-    Fully in-process GPIO mock.  No external dependencies.
-
-    PTT and COS state can be read or driven directly for testing:
-        hw.simulate_cos(True)    # pretend the radio keyed up
-        print(hw.ptt)            # check PTT state
-
-    All pin changes are recorded in hw.log as (direction, pin, value) tuples.
+    Typical lifecycle:
+        hw = CM119Hardware()          # or CM119Hardware("/dev/hidraw0")
+        hw.open()
+        hw.add_cor_callback(my_cb)
+        hw.set_ptt(True)
+        ...
+        hw.close()
     """
 
-    def __init__(self):
-        self._lock: threading.Lock        = threading.Lock()
-        self._callbacks: list[Callable]   = []
-        self._ptt_gpio:  int | None       = None
-        self._cos_gpio:  int | None       = None
-        self._cos_invert: bool            = False
-        self._ptt:       bool             = False
-        self._cos:       bool             = False
-        self.log:        list[tuple]      = []   # (event, pin, value)
+    VID = 0x0d8c             # C-Media Electronics — all CM10x/CM11x PIDs
+    _READ_TIMEOUT_MS = 100   # blocking read interval (controls close() latency)
 
-    # ── HardwareBase implementation ──────────────────────────────────────────
+    # Input report bitmasks (byte 0 of the 4-byte HID input report)
+    _COR_BIT   = 0x01        # GPIO1 = Vol-Down = COR
+    _CTCSS_BIT = 0x02        # GPIO2 = Vol-Up   = CTCSS decode
 
-    def setup(self, ptt_gpio: int, cos_gpio: int,
-              cos_invert: bool = False) -> None:
-        with self._lock:
-            self._ptt_gpio   = ptt_gpio
-            self._cos_gpio   = cos_gpio
-            self._cos_invert = cos_invert
-            self.log.append(("setup", ptt_gpio, cos_gpio, cos_invert))
+    # Output report GPIO3 bitmask (PTT)
+    _PTT_BIT   = 0x04        # GPIO3 = PTT
 
-    def set_ptt(self, active: bool) -> None:
-        with self._lock:
-            self._ptt = active
-            self.log.append(("ptt", self._ptt_gpio, active))
-
-    def get_cos(self) -> bool:
-        with self._lock:
-            return self._cos
-
-    def add_cos_callback(self, cb: Callable[[bool], None]) -> None:
-        with self._lock:
-            if cb not in self._callbacks:
-                self._callbacks.append(cb)
-
-    def remove_cos_callback(self, cb: Callable[[bool], None]) -> None:
-        with self._lock:
-            self._callbacks = [c for c in self._callbacks if c is not cb]
-
-    def cleanup(self) -> None:
-        with self._lock:
-            self._ptt = False
-            self._callbacks.clear()
-            self.log.append(("cleanup", None, None))
-
-    # ── Mock-only helpers ────────────────────────────────────────────────────
-
-    @property
-    def ptt(self) -> bool:
-        """Read the current PTT output state."""
-        return self._ptt
-
-    def simulate_cos(self, active: bool) -> None:
-        """
-        Simulate a COS edge from external hardware.
-        Sets the internal COS state and fires all registered callbacks.
-        """
-        with self._lock:
-            if active == self._cos:
-                return   # no change
-            self._cos = active
-            self.log.append(("cos_edge", self._cos_gpio, active))
-            callbacks = list(self._callbacks)
-
-        # Fire callbacks outside the lock to avoid deadlocks
-        for cb in callbacks:
-            try:
-                cb(active)
-            except Exception as exc:
-                print(f"[hardware] COS callback raised: {exc}")
-
-    def print_log(self) -> None:
-        """Print the event log to stdout."""
-        for entry in self.log:
-            print("  ", entry)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Real RPi.GPIO implementation
-# ─────────────────────────────────────────────────────────────────────────────
-
-class RealHardware(HardwareBase):
-    """
-    RPi.GPIO back-end.  Raises ImportError if RPi.GPIO is not installed.
-
-    Uses BCM pin numbering.  COS edges are detected with GPIO.add_event_detect
-    on BOTH edges; cos_invert=True inverts the active-high assumption
-    (use when COS goes LOW on carrier detect).
-    """
-
-    def __init__(self):
+    def __init__(self, hidraw_device: str = "") -> None:
         try:
-            import RPi.GPIO as GPIO
+            import hid
         except ImportError:
             raise ImportError(
-                "RPi.GPIO is not available.  "
-                "Use MockHardware (mock=True) for non-Pi development."
+                "hidapi not found.  "
+                "Install: pip install hidapi  &&  "
+                "sudo apt install libhidapi-hidraw0"
             )
-        self._GPIO       = GPIO
-        self._lock       = threading.Lock()
-        self._callbacks: list[Callable] = []
-        self._ptt_gpio:  int | None     = None
-        self._cos_gpio:  int | None     = None
-        self._cos_invert: bool          = False
+        self._hid             = hid
+        self._path            = hidraw_device.encode() if hidraw_device else None
+        self._device          = None
+        self._lock            = threading.Lock()
+        self._cor_cbs:   list[Callable[[bool], None]] = []
+        self._ctcss_cbs: list[Callable[[bool], None]] = []
+        self._cor_state:   bool = False
+        self._ctcss_state: bool = False
+        self._stop            = threading.Event()
+        self._thread: threading.Thread | None = None
 
-    def setup(self, ptt_gpio: int, cos_gpio: int,
-              cos_invert: bool = False) -> None:
-        GPIO = self._GPIO
-        self._ptt_gpio   = ptt_gpio
-        self._cos_gpio   = cos_gpio
-        self._cos_invert = cos_invert
+    # ── public API ─────────────────────────────────────────────────────────────
 
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        GPIO.setup(ptt_gpio, GPIO.OUT, initial=GPIO.LOW)
-        GPIO.setup(cos_gpio, GPIO.IN,  pull_up_down=GPIO.PUD_DOWN)
-        GPIO.add_event_detect(cos_gpio, GPIO.BOTH,
-                              callback=self._gpio_cos_edge, bouncetime=20)
+    def open(self) -> None:
+        """Open the HID device and start the background reader thread."""
+        self._device = self._hid.device()
+        if self._path:
+            self._device.open_path(self._path)
+        else:
+            path = self._autodetect()
+            if path is None:
+                raise RuntimeError(
+                    f"No CM119-compatible HID device found (VID 0x{self.VID:04x}).  "
+                    "Check the udev rule and USB connection."
+                )
+            self._device.open_path(path)
+
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._reader, daemon=True, name="cm119-hid"
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        """Deassert PTT, stop the reader thread, and close the HID device."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        with self._lock:
+            if self._device is not None:
+                try:
+                    # Deassert PTT before closing so the radio doesn't get stuck transmitting
+                    self._device.write(bytes([0x00, 0x00, self._PTT_BIT, 0x00, 0x00]))
+                except Exception:
+                    pass
+                self._device.close()
+                self._device = None
 
     def set_ptt(self, active: bool) -> None:
-        self._GPIO.output(self._ptt_gpio,
-                          self._GPIO.HIGH if active else self._GPIO.LOW)
-
-    def get_cos(self) -> bool:
-        raw = bool(self._GPIO.input(self._cos_gpio))
-        return (not raw) if self._cos_invert else raw
-
-    def add_cos_callback(self, cb: Callable[[bool], None]) -> None:
+        """Drive the PTT output (GPIO3) high or low."""
+        val = self._PTT_BIT if active else 0x00
         with self._lock:
-            if cb not in self._callbacks:
-                self._callbacks.append(cb)
+            if self._device is not None:
+                self._device.write(bytes([0x00, 0x00, self._PTT_BIT, val, 0x00]))
 
-    def remove_cos_callback(self, cb: Callable[[bool], None]) -> None:
+    def get_cor(self) -> bool:
+        """Return the current COR input state."""
         with self._lock:
-            self._callbacks = [c for c in self._callbacks if c is not cb]
+            return self._cor_state
 
-    def cleanup(self) -> None:
-        self._GPIO.cleanup()
+    def get_ctcss(self) -> bool:
+        """Return the current hardware CTCSS decode state."""
         with self._lock:
-            self._callbacks.clear()
+            return self._ctcss_state
 
-    def _gpio_cos_edge(self, channel: int) -> None:
-        """Called by RPi.GPIO on any COS edge."""
-        active = self.get_cos()
+    def add_cor_callback(self, cb: Callable[[bool], None]) -> None:
         with self._lock:
-            callbacks = list(self._callbacks)
-        for cb in callbacks:
+            if cb not in self._cor_cbs:
+                self._cor_cbs.append(cb)
+
+    def remove_cor_callback(self, cb: Callable[[bool], None]) -> None:
+        with self._lock:
+            self._cor_cbs = [c for c in self._cor_cbs if c is not cb]
+
+    def add_ctcss_callback(self, cb: Callable[[bool], None]) -> None:
+        with self._lock:
+            if cb not in self._ctcss_cbs:
+                self._ctcss_cbs.append(cb)
+
+    def remove_ctcss_callback(self, cb: Callable[[bool], None]) -> None:
+        with self._lock:
+            self._ctcss_cbs = [c for c in self._ctcss_cbs if c is not cb]
+
+    # ── internal ───────────────────────────────────────────────────────────────
+
+    def _autodetect(self) -> bytes | None:
+        devs = self._hid.enumerate(self.VID, 0)
+        return devs[0]["path"] if devs else None
+
+    def _reader(self) -> None:
+        """Blocking HID read loop — runs until close() sets _stop."""
+        while not self._stop.is_set():
             try:
-                cb(active)
+                data = self._device.read(4, timeout_ms=self._READ_TIMEOUT_MS)
             except Exception as exc:
-                print(f"[hardware] COS callback raised: {exc}")
+                print(f"[cm119] HID read error: {exc}")
+                break
+            if data:
+                self._process(bytes(data))
 
+    def _process(self, data: bytes) -> None:
+        """Parse one input report; fire edge callbacks on state change."""
+        b0        = data[0]
+        new_cor   = bool(b0 & self._COR_BIT)
+        new_ctcss = bool(b0 & self._CTCSS_BIT)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Factory
-# ─────────────────────────────────────────────────────────────────────────────
+        cor_cbs = ctcss_cbs = []
+        cor_val = ctcss_val = False
 
-def get_hardware(mock: bool = True) -> HardwareBase:
-    """
-    Return the appropriate hardware back-end.
+        with self._lock:
+            if new_cor != self._cor_state:
+                self._cor_state = new_cor
+                cor_val = new_cor
+                cor_cbs = list(self._cor_cbs)
+            if new_ctcss != self._ctcss_state:
+                self._ctcss_state = new_ctcss
+                ctcss_val = new_ctcss
+                ctcss_cbs = list(self._ctcss_cbs)
 
-      mock=True  → MockHardware  (safe on any platform)
-      mock=False → RealHardware  (requires Raspberry Pi + RPi.GPIO)
-    """
-    if mock:
-        return MockHardware()
-    return RealHardware()
+        for cb in cor_cbs:
+            try:
+                cb(cor_val)
+            except Exception as exc:
+                print(f"[cm119] COR callback error: {exc}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quick self-test
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("hardware.py self-test (MockHardware)")
-
-    hw = MockHardware()
-    hw.setup(ptt_gpio=17, cos_gpio=27, cos_invert=False)
-
-    events: list[tuple] = []
-
-    def on_cos(active: bool):
-        events.append(("callback", active))
-        print(f"  COS callback: {'UP' if active else 'DOWN'}")
-
-    hw.add_cos_callback(on_cos)
-
-    hw.set_ptt(True)
-    print(f"  PTT on  : {hw.ptt}")
-
-    hw.simulate_cos(True)
-    hw.simulate_cos(False)
-    hw.simulate_cos(True)
-
-    hw.set_ptt(False)
-    print(f"  PTT off : {hw.ptt}")
-
-    hw.cleanup()
-
-    print(f"\n  Log entries : {len(hw.log)}")
-    print(f"  COS callbacks fired: {len(events)}")
-    hw.print_log()
-    print("\nSelf-test complete.")
+        for cb in ctcss_cbs:
+            try:
+                cb(ctcss_val)
+            except Exception as exc:
+                print(f"[cm119] CTCSS callback error: {exc}")

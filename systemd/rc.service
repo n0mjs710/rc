@@ -1,0 +1,25 @@
+[Unit]
+Description=Repeater Controller Daemon
+After=network.target sound.target
+Wants=sound.target
+
+[Service]
+Type=notify
+User=pi
+Group=audio
+WorkingDirectory=/home/pi/rc
+ExecStart=/home/pi/rc/venv/bin/python /home/pi/rc/daemon.py /home/pi/rc/repeater.toml
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=rc
+RuntimeDirectoryMode=0755
+
+# Reduce attack surface — daemon only needs audio and USB HID
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/rc /home/pi/rc/repeater.local.toml
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
