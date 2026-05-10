@@ -29,4 +29,4 @@ Thumbs.db
 *.local.toml
 
 # Pre-rendered vocabulary (large binary files, regenerate with render_vocab.py)
-vocab_pcm/
+#vocab_pcm/
