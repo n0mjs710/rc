@@ -44,7 +44,17 @@ The right audio output channel is reserved for a future CTCSS encode tone.
 ```
 Raspberry Pi OS (Debian-based, ARM)
 Python 3.11+
-sudo apt install python3-dev libhidapi-hidraw0
+```
+
+System packages (apt):
+```bash
+sudo apt install python3-dev python3-venv libportaudio2 libhidapi-hidraw0
+```
+
+Python packages (pip into a venv):
+```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt   # numpy, sounddevice, scipy, hidapi
 ```
 

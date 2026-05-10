@@ -23,7 +23,7 @@ The daemon serves a Unix socket at `/run/rc/rc.sock` (configurable). The shell c
 ## Pi setup
 
 ```bash
-sudo apt install python3-dev libhidapi-hidraw0
+sudo apt install python3-dev python3-venv libportaudio2 libhidapi-hidraw0
 pip install -r requirements.txt     # numpy, sounddevice, scipy, hidapi
 
 # udev rule for /dev/hidraw* access without sudo
