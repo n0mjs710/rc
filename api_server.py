@@ -7,7 +7,7 @@ The daemon listens for shell connections on a Unix socket.
 Commands (shell → daemon):
   {"cmd": "state"}                              → current port status
   {"cmd": "config"}                             → full config dict
-  {"cmd": "set", "args": "tail 2500"}           → apply a set command
+  {"cmd": "set", "args": "hang 2500"}           → apply a set command
   {"cmd": "play", "msg": "default_cw"}          → queue a message
   {"cmd": "ptt", "active": true}                → force PTT on/off
   {"cmd": "reload"}                             → reload config from disk
@@ -80,15 +80,18 @@ class APIServer:
 
     def push_event(self, event: dict) -> None:
         """Broadcast a push event to all subscribed clients (non-blocking)."""
-        dead = []
         payload = _encode(event)
+        dead    = []
         for w in list(self._subscribers):
             try:
                 w.write(payload)
             except Exception:
                 dead.append(w)
         for w in dead:
-            self._subscribers.discard(w)
+            try:
+                self._subscribers.remove(w)
+            except ValueError:
+                pass
 
     # ── connection handler ────────────────────────────────────────────────────
 

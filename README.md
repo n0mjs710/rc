@@ -8,7 +8,7 @@ A software repeater controller for FM amateur radio, targeting Raspberry Pi 3+ w
 
 ## What it does
 
-This controller manages a half-duplex FM repeater:
+This controller manages a full-duplex FM repeater (simultaneous receive and transmit on separate frequencies via a hardware duplexer):
 
 - Monitors the **COR** (Carrier Operated Relay) signal from the radio interface to detect incoming transmissions
 - Keys the repeater's **PTT** (Push-To-Talk) when access conditions are met and gates received audio back out on the transmit path
@@ -84,7 +84,7 @@ The daemon exposes a Unix domain socket (`/run/rc/rc.sock` by default). The shel
 ```
 state               Show repeater state (IDLE/ACTIVE/TAIL/TIMEOUT)
 config              Show current configuration
-set <field> <val>   Change a config value live (e.g. "set tail 2500")
+set <field> <val>   Change a config value live (e.g. "set hang 2500")
 play <message>      Trigger a named message (e.g. "play default_cw")
 ptt on|off          Force PTT on or off
 subscribe           Stream state-change events (Ctrl-C to stop)
@@ -96,8 +96,8 @@ quit                Disconnect
 
 Set examples:
 ```
-set tail 2500         2500 ms tail timer
-set hang 500ms
+set hang 2500         2500 ms hang time (PTT holdoff)
+set ct delay 500ms    500 ms CT delay
 set timeout 3m
 set morse wpm 20
 set morse pitch 700
@@ -120,8 +120,8 @@ tx_preemphasis  = false  # FM pre-emphasis on transmitted audio
 repeat_gain     = 1.0    # RX passthrough level multiplier
 
 [timers]
-tail        = 2.5    # s — PTT hold after COR drops
-hang        = 5.0    # s — delay before courtesy tone
+hang        = 2.5    # s — hang time: PTT holdoff after CT ("hangup time")
+ct_delay    = 0.5    # s — delay from RX stream loss to courtesy tone
 kerchunk    = 0.5    # s — minimum COR hold to respond
 timeout     = 180.0  # s — TOT cutoff
 id_interval = 600.0  # s — FCC ID interval (≤ 10 min)

@@ -59,7 +59,7 @@ Key sections:
 - `[hardware]` — hidraw_device (empty = auto-detect), audio_device
 - `[audio]` — sample_rate (16000), rx_hpf, rx_deemphasis, tx_preemphasis, repeat_gain, morse/voice levels
 - `[ctcss]` — access_mode ("cor" or "cor_ctcss")
-- `[timers]` — tail, hang, kerchunk, timeout, id_interval
+- `[timers]` — hang (PTT holdoff/"hangup time"), ct_delay (pre-CT pause), kerchunk, timeout, id_interval
 - `[identity]` — callsign, message rotation lists, ct_message
 - `[messages]` — named sequences of cw/voice/tone elements
 - `[courtesy_tones]` — named tone sequences [freq1, freq2, ms, amp]
@@ -87,11 +87,21 @@ Key sections:
 
 **State machine** (port.py):
 - IDLE → ACTIVE: COR up (+ CTCSS if cor_ctcss mode)
-- ACTIVE → TAIL: COR down (after kerchunk check)
-- TAIL → IDLE: tail timer expires
-- TAIL: hang timer fires courtesy tone before tail drops PTT
-- ACTIVE → TIMEOUT: TOT exceeded
-- TIMEOUT → IDLE: COR drops
+- ACTIVE → TAIL: COR (or CTCSS in cor_ctcss mode) drops (after kerchunk check)
+- TAIL: ct_delay timer fires → CT plays → TOT resets → hang timer starts
+- TAIL → IDLE: hang timer expires (TX "hangs up" = PTT off)
+- TAIL → ACTIVE: COR (+ CTCSS) comes back up during hang; TOT continues if CT hasn't fired yet, fresh TOT if CT already fired and reset it
+- ACTIVE → TIMEOUT: TOT exceeded; RX gate closes, timeout message plays, PTT off, locked out
+- TIMEOUT → TAIL: Offending COR drops; TX comes back up, plays timeout-cancel message (if configured), hang runs, PTT off → IDLE
+- TIMEOUT: incoming qualified signals are ignored (locked out); ID timer fires normally (PTT on for ID, off after)
+
+**Async audio playback** (port.py): IDs, timeout announce, and timeout-cancel message use `create_task` + `_drain_clips()` to wait for the clip queue to empty before dropping PTT. This ensures audio actually plays; it's necessary because `play_message()` queues samples to the engine deque — PTT must stay on until the audio callback consumes them.
+
+**RX audio source gating** (port.py + audio_engine.py):
+- Passthrough gates on hardware signal edges, not state transitions
+- "cor" mode: passthrough open when COR is active
+- "cor_ctcss" mode: passthrough open when both COR and CTCSS are active
+- Closes the moment the qualifying signal drops (not when TAIL is entered)
 
 ## Next implementation tasks
 

@@ -11,7 +11,7 @@ IDLE     — quiet, PTT off
 PENDING  — one required signal is present, waiting for the other
            (cor_ctcss access mode only)
 ACTIVE   — PTT on, repeating audio
-TAIL     — COR dropped, PTT still on, hang/tail timers running
+TAIL     — COR dropped, PTT still on; ct_delay → CT → hang timers running
 TIMEOUT  — TOT exceeded, TX locked out until COR drops
 
 Access modes
@@ -30,7 +30,7 @@ from typing import Callable
 
 from rc_config import RepeaterConfig
 from hardware  import CM119Hardware
-from audio_engine import AudioEngine, Clip, VocabCache
+from audio_engine import AudioEngine, VocabCache
 from tones import render_tone
 import morse
 
@@ -84,8 +84,8 @@ class Port:
         self._initial_id_sent: bool = False
 
         # Timer handles
-        self._tail_timer:       asyncio.TimerHandle | None = None
-        self._hang_timer:       asyncio.TimerHandle | None = None
+        self._hang_timer:       asyncio.TimerHandle | None = None   # PTT holdoff (hangup)
+        self._ct_delay_timer:   asyncio.TimerHandle | None = None   # pre-CT delay
         self._timeout_timer:    asyncio.TimerHandle | None = None
         self._ctcss_timer:      asyncio.TimerHandle | None = None
         self._id_timer:         asyncio.TimerHandle | None = None
@@ -108,7 +108,7 @@ class Port:
     def stop(self) -> None:
         self._hw.remove_cor_callback(self._on_cor_edge)
         self._hw.remove_ctcss_callback(self._on_ctcss_edge)
-        for name in ("tail", "hang", "timeout", "ctcss", "id", "pending_id"):
+        for name in ("hang", "ct_delay", "timeout", "ctcss", "id", "pending_id"):
             self._cancel(name)
         self._set_ptt(False)
         log.info("Port stopped.")
@@ -136,8 +136,8 @@ class Port:
     async def _cor_up(self) -> None:
         self._cor = True
         self._cor_up_time = self._loop.time()
-        self._cancel("tail")
         self._cancel("hang")
+        self._cancel("ct_delay")
         am = self.cfg.ctcss.access_mode
         log.info("COR UP  state=%s  access=%s", self.state.name, am)
 
@@ -145,11 +145,15 @@ class Port:
             if self.state in (State.IDLE, State.TAIL):
                 self._set_ptt(True)
                 self._transition(State.ACTIVE)
-                self._schedule_timeout()
+                # Don't restart TOT if it's still counting (re-key during ct_delay);
+                # the running timer continues so the operator can't reset it by
+                # briefly dropping and re-keying before the CT fires.
+                if self._timeout_timer is None:
+                    self._schedule_timeout()
 
         elif am == "cor_ctcss":
             if self.state == State.PENDING and self._ctcss:
-                # CTCSS arrived first; COR now present
+                # CTCSS arrived first; COR now present — always a fresh start
                 self._cancel("ctcss")
                 self._set_ptt(True)
                 self._transition(State.ACTIVE)
@@ -158,34 +162,48 @@ class Port:
                 if self._ctcss:
                     self._set_ptt(True)
                     self._transition(State.ACTIVE)
-                    self._schedule_timeout()
+                    if self._timeout_timer is None:
+                        self._schedule_timeout()
                 else:
                     self._transition(State.PENDING)
                     self._schedule_ctcss_timeout()
 
+        self._update_passthrough()
+
     async def _cor_down(self) -> None:
         self._cor = False
-        self._cancel("timeout")
         self._cancel("ctcss")
         duration = self._loop.time() - self._cor_up_time
         log.info("COR DOWN  duration=%.2fs  state=%s", duration, self.state.name)
 
         if self.state == State.PENDING:
+            self._cancel("timeout")
             self._transition(State.IDLE)
 
         elif self.state in (State.ACTIVE, State.TAIL):
             if self.state == State.ACTIVE and duration < self.cfg.timers.kerchunk:
                 log.info("Kerchunk suppressed (%.2fs < %.2fs)",
                          duration, self.cfg.timers.kerchunk)
+                self._cancel("timeout")
                 self._set_ptt(False)
                 self._transition(State.IDLE)
             else:
+                # TOT stays active until the CT plays; _on_ct_delay() resets it
+                # and starts the hang timer.  This ensures operators wait for the
+                # CT before re-keying (enforces courteous operation).
                 self._transition(State.TAIL)
-                self._schedule_hang()
-                self._schedule_tail()
+                self._schedule_ct_delay()
 
         elif self.state == State.TIMEOUT:
-            self._transition(State.IDLE)
+            # Offending transmission ended; TX comes back up for cancel msg + hang,
+            # just like the end of a normal QSO (minus ct_delay — the cancel msg
+            # serves that purpose).
+            log.info("Timeout cleared — TX resuming for cancel message and hang")
+            self._set_ptt(True)
+            self._transition(State.TAIL)
+            self._loop.create_task(self._do_timeout_recovery())
+
+        self._update_passthrough()
 
     # ── CTCSS event handlers ──────────────────────────────────────────────────
 
@@ -208,12 +226,17 @@ class Port:
                 self._schedule_timeout()
             elif self.state in (State.IDLE, State.TAIL):
                 if self._cor:
+                    self._cancel("ct_delay")
+                    self._cancel("hang")
                     self._set_ptt(True)
                     self._transition(State.ACTIVE)
-                    self._schedule_timeout()
+                    if self._timeout_timer is None:
+                        self._schedule_timeout()
                 else:
                     self._transition(State.PENDING)
                     self._schedule_ctcss_timeout()
+
+        self._update_passthrough()
 
     async def _ctcss_down(self) -> None:
         self._ctcss = False
@@ -222,21 +245,22 @@ class Port:
 
         if am == "cor_ctcss" and self.state == State.ACTIVE:
             log.info("CTCSS loss in cor_ctcss mode → tail")
-            self._cancel("timeout")
             self._transition(State.TAIL)
-            self._schedule_hang()
-            self._schedule_tail()
+            self._schedule_ct_delay()
         elif self.state == State.PENDING:
             self._cancel("ctcss")
             self._transition(State.IDLE)
 
+        self._update_passthrough()
+
     # ── timer scheduling ──────────────────────────────────────────────────────
+
+    def _schedule_ct_delay(self) -> None:
+        self._ct_delay_timer = self._loop.call_later(
+            self.cfg.timers.ct_delay, self._on_ct_delay)
 
     def _schedule_hang(self) -> None:
         self._hang_timer = self._loop.call_later(self.cfg.timers.hang, self._on_hang)
-
-    def _schedule_tail(self) -> None:
-        self._tail_timer = self._loop.call_later(self.cfg.timers.tail, self._on_tail)
 
     def _schedule_timeout(self) -> None:
         self._timeout_timer = self._loop.call_later(
@@ -267,37 +291,37 @@ class Port:
 
     # ── timer callbacks ───────────────────────────────────────────────────────
 
+    def _on_ct_delay(self) -> None:
+        self._ct_delay_timer = None
+        if self.state != State.TAIL:
+            return
+        name = self.cfg.identity.ct_message
+        if name:
+            log.info("CT delay — playing '%s'", name)
+            self._play_message(name)
+        # CT has played (or was skipped); reset TOT and start the hang timer.
+        # TOT resets here — not at COR drop — so operators must wait through
+        # the CT before re-keying (enforces courteous operation).
+        self._cancel("timeout")
+        self._schedule_hang()
+
     def _on_hang(self) -> None:
         self._hang_timer = None
-        name = self.cfg.identity.ct_message
-        if not name:
-            return
-        log.info("Hang timer — playing '%s'", name)
-        was_ptt = self._cor
-        if not was_ptt:
-            self._set_ptt(True)
-        self._play_message(name)
-        if not was_ptt:
-            self._set_ptt(False)
-
-    def _on_tail(self) -> None:
-        self._tail_timer = None
         if self._cor:
-            return   # COR came back up while tail was running
+            return   # COR came back up during hang; state machine will handle it
         self._set_ptt(False)
         self._transition(State.IDLE)
 
     def _on_timeout(self) -> None:
         self._timeout_timer = None
-        log.warning("TOT — forcing PTT off")
-        self._engine.clear_clips()
-        self._set_ptt(False)
+        log.warning("TOT — locking out repeater")
+        # Transition first so _update_passthrough sees TIMEOUT and closes the gate.
         self._transition(State.TIMEOUT)
-        name = self.cfg.identity.timeout_message
-        if name:
-            self._set_ptt(True)
-            self._play_message(name)
-            self._set_ptt(False)
+        self._update_passthrough()
+        self._engine.clear_clips()
+        # Play timeout message while PTT is still on, then drop PTT asynchronously
+        # so the audio callback has time to consume the queued samples.
+        self._loop.create_task(self._do_timeout_announce())
 
     def _on_ctcss_timeout(self) -> None:
         self._ctcss_timer = None
@@ -309,20 +333,47 @@ class Port:
     def _on_pending_id(self) -> None:
         self._pending_id_timer = None
         log.info("Pending ID timer fired")
-        self._transmit_id("pending")
+        self._loop.create_task(self._transmit_id("pending"))
 
     def _on_id(self) -> None:
         self._id_timer = None
         log.info("Mandatory ID timer fired")
         self._cancel("pending_id")
-        self._transmit_id("mandatory")
+        self._loop.create_task(self._do_mandatory_id())
+
+    # ── async audio helpers ────────────────────────────────────────────────────
+
+    async def _drain_clips(self) -> None:
+        """Yield to the event loop until the audio engine's clip queue is empty."""
+        while self._engine.is_playing():
+            await asyncio.sleep(0.05)
+
+    async def _do_timeout_announce(self) -> None:
+        """Play the timeout message (PTT already on), then drop PTT."""
+        name = self.cfg.identity.timeout_message
+        if name:
+            self._play_message(name)
+            await self._drain_clips()
+        if self.state == State.TIMEOUT:
+            self._set_ptt(False)
+
+    async def _do_timeout_recovery(self) -> None:
+        """After timeout clears: play cancel message (if configured), then hang."""
+        name = self.cfg.identity.timeout_cancel_message
+        if name:
+            self._play_message(name)
+            await self._drain_clips()
+        if self.state == State.TAIL:
+            self._schedule_hang()
+
+    async def _do_mandatory_id(self) -> None:
+        """Transmit mandatory ID, then reschedule the ID timer."""
+        await self._transmit_id("mandatory")
         self._last_id_time = self._loop.time()
         self._schedule_id()
         self._schedule_pending_id()
 
-    # ── audio helpers ──────────────────────────────────────────────────────────
-
-    def _transmit_id(self, id_type: str) -> None:
+    async def _transmit_id(self, id_type: str) -> None:
         if id_type == "initial":
             rotation = list(self.cfg.identity.initial_ids)
         elif id_type == "pending":
@@ -339,13 +390,17 @@ class Port:
         self._id_rot[id_type] = (idx + 1) % len(rotation)
         log.info("ID (%s) → '%s'", id_type, msg_name)
 
-        was_ptt = self._cor
+        state_before = self.state
+        was_ptt = self._engine._ptt
         if not was_ptt:
             self._set_ptt(True)
-        try:
-            self._play_message(msg_name)
-        finally:
-            if not was_ptt:
+        self._play_message(msg_name)
+        if not was_ptt:
+            # PTT was off when we started; wait for audio to finish before
+            # dropping it.  If the state machine took over PTT during the
+            # await (e.g., COR came up, state changed), leave PTT alone.
+            await self._drain_clips()
+            if self.state == state_before:
                 self._set_ptt(False)
 
     def _play_message(self, name: str) -> None:
@@ -425,6 +480,29 @@ class Port:
         log.info("PTT %s", "ON" if active else "OFF")
         self._notify_listeners()
 
+    def _set_passthrough(self, active: bool) -> None:
+        self._engine.set_passthrough(active)
+        log.debug("Passthrough %s", "ON" if active else "OFF")
+
+    def _update_passthrough(self) -> None:
+        """Gate the RX audio source on live hardware signal state.
+
+        During TIMEOUT the gate is always closed — the repeater is locked out
+        and must not pass received audio regardless of COR/CTCSS state.
+        Otherwise, gate tracks hardware signal edges directly so the audio
+        engine closes the moment the signal drops, not when the state machine
+        eventually reacts.
+        """
+        if self.state == State.TIMEOUT:
+            self._set_passthrough(False)
+            return
+        am = self.cfg.ctcss.access_mode
+        if am == "cor_ctcss":
+            active = self._cor and self._ctcss
+        else:
+            active = self._cor
+        self._set_passthrough(active)
+
     def _transition(self, new_state: State) -> None:
         old = self.state
         self.state = new_state
@@ -436,7 +514,7 @@ class Port:
             if elapsed >= self.cfg.timers.id_interval and not self._initial_id_sent:
                 self._initial_id_sent = True
                 log.info("Initial ID (idle %.0fs)", elapsed)
-                self._transmit_id("initial")
+                self._loop.create_task(self._transmit_id("initial"))
                 self._last_id_time = self._loop.time()
                 self._cancel("id")
                 self._schedule_id()

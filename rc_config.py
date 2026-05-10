@@ -47,8 +47,8 @@ class CTCSSConfig:
 
 @dataclass
 class TimerConfig:
-    tail:        float = 2.5    # s — PTT hold after COR drops
-    hang:        float = 0.5    # s — delay before courtesy tone
+    hang:        float = 2.5    # s — hangup time: PTT hold after CT (how long before TX "hangs up")
+    ct_delay:    float = 0.5    # s — delay from RX loss to courtesy tone
     kerchunk:    float = 0.5    # s — minimum COR hold to respond
     timeout:     float = 180.0  # s — TOT transmit cutoff
     id_interval: float = 600.0  # s — mandatory ID interval (FCC ≤ 10 min)
@@ -57,12 +57,13 @@ class TimerConfig:
 
 @dataclass
 class IdentityConfig:
-    callsign:      str  = "N0CALL"
-    initial_ids:   list = field(default_factory=lambda: ["default_cw"])
-    pending_ids:   list = field(default_factory=lambda: ["default_cw"])
-    mandatory_ids: list = field(default_factory=lambda: ["default_cw"])
-    ct_message:    str  = "hang_ct"
-    timeout_message: str = "timeout_warn"
+    callsign:               str  = "N0CALL"
+    initial_ids:            list = field(default_factory=lambda: ["default_cw"])
+    pending_ids:            list = field(default_factory=lambda: ["default_cw"])
+    mandatory_ids:          list = field(default_factory=lambda: ["default_cw"])
+    ct_message:             str  = "hang_ct"
+    timeout_message:        str  = "timeout_warn"
+    timeout_cancel_message: str  = ""  # played when TOT clears; not yet defined
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,8 +237,8 @@ class RepeaterConfig:
             f"  Access mode    : {c.ctcss.access_mode}",
             "",
             "── Timers ───────────────────────────────────",
-            f"  Tail           : {t.tail*1000:.0f} ms",
             f"  Hang           : {t.hang*1000:.0f} ms",
+            f"  CT delay       : {t.ct_delay*1000:.0f} ms",
             f"  Kerchunk       : {t.kerchunk*1000:.0f} ms",
             f"  Timeout (TOT)  : {t.timeout:.0f} s",
             f"  ID interval    : {t.id_interval:.0f} s",
@@ -250,6 +251,7 @@ class RepeaterConfig:
             f"  Mandatory IDs  : {', '.join(c.identity.mandatory_ids) or '(none)'}",
             f"  CT message     : {c.identity.ct_message or '(none)'}",
             f"  Timeout msg    : {c.identity.timeout_message or '(none)'}",
+            f"  Timeout cancel : {c.identity.timeout_cancel_message or '(not configured)'}",
             "",
             "── Messages ─────────────────────────────────",
         ] + (msg_lines or ["  (none)"])
@@ -363,8 +365,8 @@ _BOOL_FALSE = {"false", "no", "off", "0", "disable", "disabled"}
 # (keyword_set, section, field_name)
 _ALIASES: list[tuple[set[str], str, str]] = [
     # timers (ms fields: bare number = ms)
-    ({"tail"},                                            "timers",   "tail"),
-    ({"hang", "delay"},                                   "timers",   "hang"),
+    ({"hang", "hangup", "holdoff"},                       "timers",   "hang"),
+    ({"ct", "delay", "courtesy", "pre"},                  "timers",   "ct_delay"),
     ({"kerchunk", "kerchunk", "minimum"},                 "timers",   "kerchunk"),
     ({"timeout", "tot"},                                  "timers",   "timeout"),
     ({"id", "interval", "period"},                        "timers",   "id_interval"),
@@ -394,7 +396,7 @@ _ALIASES: list[tuple[set[str], str, str]] = [
 ]
 
 _FIELD_TYPES: dict[str, str] = {
-    "tail": "time_ms", "hang": "time_ms", "kerchunk": "time_ms",
+    "hang": "time_ms", "ct_delay": "time_ms", "kerchunk": "time_ms",
     "timeout": "time", "id_interval": "time", "id_pending": "time",
     "morse_wpm": "int", "morse_pitch": "int",
     "morse_level": "float", "voice_level": "float", "repeat_gain": "float",

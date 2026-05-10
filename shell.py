@@ -14,7 +14,7 @@ Commands
 ────────
   state               Show current repeater state
   config              Show full configuration
-  set <args>          Change a config value (e.g. "set tail 2500")
+  set <args>          Change a config value (e.g. "set hang 2500")
   play <message>      Trigger a named message
   ptt on|off          Force PTT on or off
   reload              Reload config from disk
@@ -24,9 +24,9 @@ Commands
   quit / exit         Disconnect
 
 Set examples:
-  set tail 2500          2500 ms tail
-  set tail 2.5s          same, using seconds
-  set hang 500ms
+  set hang 2500          2500 ms hang time (PTT holdoff)
+  set hang 2.5s          same, using seconds
+  set ct delay 500ms     500 ms CT delay (pre-courtesy-tone pause)
   set timeout 180
   set morse wpm 20
   set voice level 90
@@ -252,7 +252,7 @@ def interactive_shell(conn: DaemonConnection) -> None:
 
         elif cmd == "set":
             if not rest:
-                print("Usage: set <field> <value>  (e.g. 'set tail 2500')")
+                print("Usage: set <field> <value>  (e.g. 'set hang 2500')")
                 continue
             resp = conn.command({"cmd": "set", "args": rest})
             _print_response(resp)

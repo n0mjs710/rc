@@ -20,8 +20,11 @@ Requirements:
 """
 
 from __future__ import annotations
+import logging
 import threading
 from typing import Callable
+
+log = logging.getLogger("hardware")
 
 
 class CM119Hardware:
@@ -152,7 +155,7 @@ class CM119Hardware:
             try:
                 data = self._device.read(4, timeout_ms=self._READ_TIMEOUT_MS)
             except Exception as exc:
-                print(f"[cm119] HID read error: {exc}")
+                log.error("HID read error: %s", exc)
                 break
             if data:
                 self._process(bytes(data))
@@ -180,10 +183,10 @@ class CM119Hardware:
             try:
                 cb(cor_val)
             except Exception as exc:
-                print(f"[cm119] COR callback error: {exc}")
+                log.error("COR callback error: %s", exc)
 
         for cb in ctcss_cbs:
             try:
                 cb(ctcss_val)
             except Exception as exc:
-                print(f"[cm119] CTCSS callback error: {exc}")
+                log.error("CTCSS callback error: %s", exc)

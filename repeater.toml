@@ -23,8 +23,8 @@ voice_blocks_repeat = false   # mute RX passthrough while VOICE clips play
 access_mode = "cor_ctcss"   # "cor" (COR alone) or "cor_ctcss" (both required)
 
 [timers]
-tail        = 2.5     # s — PTT hold after COR drops
-hang        = 5.0     # s — delay before courtesy tone
+hang        = 2.5     # s — hang time: PTT holdoff after CT (how long before TX "hangs up")
+ct_delay    = 0.5     # s — delay from RX stream loss to courtesy tone
 kerchunk    = 0.5     # s — minimum COR hold to respond (anti-kerchunk)
 timeout     = 180.0   # s — time-out timer (TOT) transmit cutoff
 id_interval = 600.0   # s — mandatory ID interval (FCC ≤ 10 min)

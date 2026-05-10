@@ -78,9 +78,12 @@ class Daemon:
 
         # Audio engine
         ac = self.cfg.audio
+        audio_dev = self.cfg.hardware.audio_device or None  # None = system default
         self._engine = AudioEngine(
             sample_rate         = ac.sample_rate,
             blocksize           = ac.sample_rate // 50,   # 20 ms
+            input_device        = audio_dev,
+            output_device       = audio_dev,
             rx_hpf              = ac.rx_hpf,
             rx_deemphasis       = ac.rx_deemphasis,
             tx_preemphasis      = ac.tx_preemphasis,
@@ -151,14 +154,14 @@ class Daemon:
             return {"error": "port not running"}
         if msg_name not in self.cfg.messages:
             return {"error": f"unknown message: {msg_name!r}"}
-        was_ptt = self._port._cor
+        was_ptt = self._engine._ptt
         if not was_ptt:
-            self._hw.set_ptt(True)
-            self._engine.set_ptt(True)
+            self._port._set_ptt(True)
         self._port._play_message(msg_name)
         if not was_ptt:
-            self._hw.set_ptt(False)
-            self._engine.set_ptt(False)
+            while self._engine.is_playing():
+                await asyncio.sleep(0.05)
+            self._port._set_ptt(False)
         return {}
 
     async def _cmd_ptt(self, msg: dict) -> dict:

@@ -156,8 +156,8 @@ class AudioEngine:
     def __init__(self,
                  sample_rate:         int        = 16_000,
                  blocksize:           int        = 320,
-                 input_device:        int | None = None,
-                 output_device:       int | None = None,
+                 input_device:        str | int | None = None,
+                 output_device:       str | int | None = None,
                  rx_hpf:              bool       = True,
                  rx_deemphasis:       bool       = True,
                  tx_preemphasis:      bool       = False,
@@ -182,6 +182,15 @@ class AudioEngine:
         # PTT state
         self._ptt      = False
         self._ptt_lock = threading.Lock()
+
+        # RX source gate — True when the hardware presents a valid signal
+        # (COR active, or COR+CTCSS active depending on access mode).
+        # The port drives this directly from the hardware signal edges, not
+        # from state transitions, so the gate tracks the actual signal presence.
+        # When the signal drops the RX source closes immediately, preventing
+        # FM squelch noise from an ungated discriminator reaching the TX during
+        # tail/hang.  Queued clips play regardless of this gate.
+        self._passthrough = False
 
         # Clip queue (left channel / main TX mix)
         self._clips:    deque[Clip] = deque()
@@ -217,9 +226,23 @@ class AudioEngine:
         log.info("Audio stream stopped.")
 
     def set_ptt(self, active: bool) -> None:
-        """Enable or disable TX output."""
+        """Enable or disable TX output.  Resets RX filter state on rising edge."""
         with self._ptt_lock:
+            prev      = self._ptt
             self._ptt = active
+        if active and not prev:
+            self._reset_rx_filters()
+
+    def set_passthrough(self, active: bool) -> None:
+        """
+        Gate the RX→TX audio passthrough.
+
+        Set True while the qualifying signal is present (COR, or COR+CTCSS)
+        so received audio is re-transmitted.  Set False the moment the signal
+        drops so FM squelch noise from an ungated discriminator does not reach
+        the TX during CT delay, CT playback, or hang.  Queued clips continue.
+        """
+        self._passthrough = active
 
     def play_clip(self, clip: Clip, priority: bool = False) -> None:
         """Queue a clip for TX playback.  priority=True plays it next."""
@@ -247,6 +270,13 @@ class AudioEngine:
     def set_repeat_gain(self, gain: float) -> None:
         self._repeat_gain = gain
 
+    def _reset_rx_filters(self) -> None:
+        """Clear RX filter state so each new QSO starts from a known zero state."""
+        if self._rx_hpf is not None:
+            self._rx_hpf._zi[:] = 0
+        if self._rx_deemph is not None:
+            self._rx_deemph._zi[:] = 0
+
     # ── sounddevice callback ─────────────────────────────────────────────────
 
     def _callback(self,
@@ -259,7 +289,16 @@ class AudioEngine:
         if status:
             log.warning("Audio status: %s", status)
 
-        rx = indata[:, 0].copy()   # mono RX
+        with self._ptt_lock:
+            ptt = self._ptt
+
+        # No access condition / PTT not engaged — nothing to do
+        if not ptt:
+            outdata[:] = 0
+            return
+
+        # ── RX path (only while PTT is active) ───────────────────────────────
+        rx = indata[:, 0].copy()
 
         # ADC clipping check
         peak = float(np.max(np.abs(rx)))
@@ -269,30 +308,29 @@ class AudioEngine:
                 self._last_clip_warn = now
                 log.warning("ADC clipping — peak %.3f FS; reduce input level", peak)
 
-        # Apply RX filter chain
+        # ── Future CTCSS decode hook ──────────────────────────────────────────
+        # Software CTCSS decode (Goertzel) should tap `rx` HERE — before the
+        # HPF strips the subaudible tone — then pass results to the port via a
+        # callback or queue.  The port will enable this path when
+        # ctcss.access_mode == "cor_ctcss" and no hardware decode is available.
+
         if self._rx_hpf is not None:
             rx = self._rx_hpf.process(rx)
         if self._rx_deemph is not None:
             rx = self._rx_deemph.process(rx)
 
-        with self._ptt_lock:
-            ptt = self._ptt
-
-        if not ptt:
-            outdata[:] = 0
-            return
-
-        # Check if any voice clip wants to block passthrough
+        # Build left-channel TX mix — passthrough only while qualifying signal
+        # is present.  _passthrough is False once the signal drops, keeping
+        # FM squelch noise off the TX during CT delay, CT, and hang.
         voice_blocking = False
-        if self._voice_blocks_repeat:
+        if self._passthrough and self._voice_blocks_repeat:
             with self._clip_lock:
                 voice_blocking = any(
                     c.blocks_passthrough and c.remaining() > 0
                     for c in self._clips
                 )
 
-        # Build left-channel TX mix
-        if not voice_blocking:
+        if self._passthrough and not voice_blocking:
             tx = rx * self._repeat_gain
         else:
             tx = np.zeros(frames, dtype=np.float32)
