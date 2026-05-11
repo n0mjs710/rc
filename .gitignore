@@ -24,9 +24,13 @@ env/
 .DS_Store
 Thumbs.db
 
-# Config files with possible secrets
-# (default repeater.toml is safe to commit; user-specific ones are not)
+# Site config — contains your callsign and hardware specifics; not committed
+# Copy repeater.toml.sample to repeater.toml and edit for your site.
+repeater.toml
 *.local.toml
+
+# Runtime directory — socket and pid files live here while the daemon is running
+run/
 
 # Pre-rendered vocabulary (large binary files, regenerate with render_vocab.py)
 #vocab_pcm/

@@ -14,14 +14,13 @@ When both freq1 and freq2 are non-zero, the two sines are summed and
 normalised so the combined waveform stays within the amplitude limit.
 When both are zero the element is a silence gap.
 
-Tone elements can be stored inline in message definitions or referenced
-by name from the built-in tone library below.  The built-in tones serve
-as defaults for RepeaterConfig and can be previewed with this CLI tool.
+All tones are defined in the TOML config file under [messages].
+There are no built-in defaults in code — the config is the sole source.
 
 Usage:
-  python3 tones.py <name> [config.toml]   # play named tone
-  python3 tones.py --list [config.toml]   # list available tones
-  python3 tones.py --test [config.toml]   # play all available tones in sequence
+  python3 tones.py <name> <config.toml>   # play named tone
+  python3 tones.py --list <config.toml>   # list available tones
+  python3 tones.py --test <config.toml>   # play all tones in sequence
 """
 
 import argparse
@@ -32,67 +31,6 @@ import numpy as np
 
 SAMPLE_RATE = 44100   # default for CLI playback
 ATTACK_S    = 0.005   # 5 ms raised-cosine attack/decay (click-free keying)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Built-in named tones
-# Each entry: list of elements → [freq1_hz, freq2_hz, duration_ms, amplitude]
-# ─────────────────────────────────────────────────────────────────────────────
-
-BUILTIN_TONES: dict[str, list] = {
-
-    # Classic two-pip: ascending interval, commonly used on ACC-equipped repeaters
-    "default": [
-        [1000, 0, 50, 0.8],
-        [   0, 0, 30, 0.0],
-        [1200, 0, 50, 0.8],
-    ],
-
-    # Single pip — minimal, unobtrusive
-    "single": [
-        [1000, 0, 80, 0.8],
-    ],
-
-    # Three ascending pips — used as a mild state-change indicator
-    "triple": [
-        [ 800, 0, 40, 0.8],
-        [   0, 0, 20, 0.0],
-        [1000, 0, 40, 0.8],
-        [   0, 0, 20, 0.0],
-        [1200, 0, 40, 0.8],
-    ],
-
-    # Morse K (dah-dit-dah) — traditional courtesy tone at 20 WPM timing
-    # dit = 60 ms, dah = 180 ms, inter-element gap = 60 ms
-    "K": [
-        [700, 0, 180, 0.8],
-        [  0, 0,  60, 0.0],
-        [700, 0,  60, 0.8],
-        [  0, 0,  60, 0.0],
-        [700, 0, 180, 0.8],
-    ],
-
-    # Two-tone chord — both frequencies simultaneously (e.g. DTMF-style)
-    "chord": [
-        [697, 1209, 150, 0.75],
-    ],
-
-    # Timeout warning — descending three-tone alert
-    "timeout_warn": [
-        [1200, 0, 60, 0.9],
-        [   0, 0, 20, 0.0],
-        [1000, 0, 60, 0.9],
-        [   0, 0, 20, 0.0],
-        [ 800, 0, 60, 0.9],
-    ],
-
-    # ID reminder — subtle single low pip
-    "id_pending": [
-        [880, 0, 60, 0.6],
-        [  0, 0, 30, 0.0],
-        [880, 0, 60, 0.6],
-    ],
-}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,27 +103,47 @@ def play_tone(elements: list, block: bool = True) -> None:
 # Config loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_tones_from_config(config_path: str) -> dict[str, list]:
-    """
-    Read courtesy tone definitions from a TOML repeater config file.
-    Returns a dict of {name: elements_list}, merging over BUILTIN_TONES.
-    """
-    import tomllib
-    data = tomllib.loads(Path(config_path).read_text())
-    raw  = data.get("courtesy_tones", {})
-    return {name: tone["elements"] for name, tone in raw.items()}
+def _is_tone_only(elements: list) -> bool:
+    """Return True if all elements in a message are inline tone or silence elements."""
+    return all(
+        isinstance(e, (list, tuple)) or
+        (isinstance(e, dict) and e.get("type") in ("tone", "ct") and "freq1" in e)
+        for e in elements
+    )
+
+
+def _to_list_form(elements: list) -> list:
+    """Normalise elements to [[freq1, freq2, ms, amp], ...] list form."""
+    result = []
+    for e in elements:
+        if isinstance(e, (list, tuple)):
+            result.append(list(e))
+        elif isinstance(e, dict) and "freq1" in e:
+            result.append([
+                float(e.get("freq1", 0)), float(e.get("freq2", 0)),
+                int(e.get("ms", 80)),     float(e.get("amp", 0.8)),
+            ])
+    return result
 
 
 def get_tones(config_path: str | None = None) -> dict[str, list]:
-    """Return merged dict of built-in tones plus any tones from config_path."""
-    tones = dict(BUILTIN_TONES)
-    if config_path and Path(config_path).exists():
-        try:
-            tones.update(load_tones_from_config(config_path))
-        except Exception as exc:
-            print(f"Warning: could not read tones from {config_path}: {exc}",
-                  file=sys.stderr)
-    return tones
+    """Return tone-only messages from [messages] in config_path; empty dict if none."""
+    if not config_path or not Path(config_path).exists():
+        return {}
+    import tomllib
+    try:
+        data = tomllib.loads(Path(config_path).read_text())
+        raw  = data.get("messages", {})
+        result = {}
+        for name, msg in raw.items():
+            elems = msg.get("elements", [])
+            if elems and _is_tone_only(elems):
+                result[name] = _to_list_form(elems)
+        return result
+    except Exception as exc:
+        print(f"Warning: could not read tones from {config_path}: {exc}",
+              file=sys.stderr)
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,7 +173,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("name",   nargs="?", help="name of tone to play")
-    parser.add_argument("config", nargs="?", help="TOML config file (optional)")
+    parser.add_argument("config", nargs="?", help="TOML config file")
     parser.add_argument("--list", dest="list_tones", action="store_true",
                         help="list available tone names and their elements")
     parser.add_argument("--test", action="store_true",

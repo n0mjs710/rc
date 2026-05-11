@@ -1,13 +1,11 @@
 
 [daemon]
 socket_path = "run/rc.sock"    # relative to this config file's directory
-log_level = "DEBUG"
+log_level = "INFO"
 
 [hardware]
-hidraw_device    = ""                     # leave empty for auto-detect by USB VID 0x0d8c
-audio_device     = "USB PnP Sound Device" # must be the same device for duplex RX+TX
-cor_active_low   = false  # false = bit set (high) means COR active
-ctcss_active_low = false  # false = bit set (high) means CTCSS active
+hidraw_device = ""                  # leave empty for auto-detect by USB VID 0x0d8c
+audio_device  = "USB PnP Sound Device"   # must be the same device for duplex RX+TX
 
 [audio]
 sample_rate         = 48000
@@ -17,8 +15,8 @@ tx_preemphasis      = false   # FM pre-emphasis on TX mix
 repeat_gain         = 1.0     # RX passthrough gain (1.0 = unity)
 morse_wpm           = 20
 morse_pitch         = 700
-morse_level         = 0.5
-voice_level         = 1.0
+morse_level         = 0.9
+voice_level         = 0.9
 voice_blocks_repeat = false   # mute RX passthrough while VOICE clips play
 
 [ctcss]
@@ -33,33 +31,15 @@ id_interval = 600.0   # s — mandatory ID interval (FCC ≤ 10 min)
 id_pending  = 60.0    # s — queue pending ID this far before deadline
 
 [identity]
-startup_message = "rc08_startup"
+# Callsign is not a separate config field — define it in your ID messages below.
 initial_ids   = ["default_voice"]
 pending_ids   = ["default_voice"]
 mandatory_ids = ["default_cw"]
 ct_message    = "yellow_jacket"
 timeout_message = "timeout_warn"
 
-[messages.rc08_startup]
-# "R C Zero Eight Repeater Control V One Point Zero — Ready"
-# CONTROLLER clip not in vocab_pcm; using CONTROL. Add user_pcm/CONTROLLER.wav to fix.
-elements = [
-  {type = "voice", clip = "R"},
-  {type = "voice", clip = "C"},
-  {type = "voice", clip = "ZERO"},
-  {type = "voice", clip = "EIGHT"},
-  {type = "voice", clip = "REPEATER"},
-  {type = "voice", clip = "CONTROL"},
-  {type = "voice", clip = "V"},
-  {type = "voice", clip = "ONE"},
-  {type = "voice", clip = "POINT"},
-  {type = "voice", clip = "ZERO"},
-  {type = "voice", clip = "PAUSE_"},
-  {type = "voice", clip = "READY"},
-]
-
 [messages.default_cw]
-elements = [{type = "cw", text = "WA0EDA/R"}]
+elements = [{type = "cw", text = "W0ABC/R"}]
 
 [messages.timeout_warn]
 elements = [
@@ -75,11 +55,10 @@ elements = [
   {type = "voice", clip = "THIS"},
   {type = "voice", clip = "IS"},
   {type = "voice", clip = "W"},
-  {type = "voice", clip = "A"},
   {type = "voice", clip = "ZERO"},
-  {type = "voice", clip = "E"},
-  {type = "voice", clip = "D"},
   {type = "voice", clip = "A"},
+  {type = "voice", clip = "B"},
+  {type = "voice", clip = "C"},
   {type = "voice", clip = "REPEATER"},
 ]
 
@@ -106,21 +85,3 @@ elements = [
 
 [messages.piano_chord]
 elements = [{type = "tone", freq1 = 660.0, freq2 = 880.0, ms = 100, amp = 0.7}]
-
-[messages.gmrs]
-elements = [
-  {type = "voice", clip = "THIS"},
-  {type = "voice", clip = "IS"},
-  {type = "voice", clip = "W"},
-  {type = "voice", clip = "Q"},
-  {type = "voice", clip = "I"},
-  {type = "voice", clip = "U"},
-  {type = "voice", clip = "SEVEN"},
-  {type = "voice", clip = "SIX"},
-  {type = "voice", clip = "FIVE"},
-  {type = "voice", clip = "G"},
-  {type = "voice", clip = "M"},
-  {type = "voice", clip = "R"},
-  {type = "voice", clip = "S"},
-  {type = "voice", clip = "REPEATER"},
-]

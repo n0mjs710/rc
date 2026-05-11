@@ -13,7 +13,7 @@ This controller manages a full-duplex FM repeater (simultaneous receive and tran
 - Monitors the **COR** (Carrier Operated Relay) signal from the radio interface to detect incoming transmissions
 - Keys the repeater's **PTT** (Push-To-Talk) when access conditions are met and gates received audio back out on the transmit path
 - Plays **courtesy tones** at the end of each transmission and **CW or voice IDs** on a configurable schedule to satisfy FCC identification requirements
-- Implements **anti-kerchunk** (minimum carrier hold time), a **time-out timer (TOT)** to prevent stuck transmitters, and tail/hang timers for a clean operating experience
+- Implements **anti-kerchunk** (minimum carrier hold time), a **time-out timer (TOT)** to prevent stuck transmitters, and CT-delay/hang timers for a clean operating experience
 - Applies **FM de-emphasis** to received audio and optional **pre-emphasis** and **300 Hz HPF** on the transmit path — all selectable per-port in config
 
 All audio processing runs in the sounddevice callback thread using NumPy. Courtesy tones and CW IDs are rendered in-process from numpy arrays at startup; there are no subprocess calls on any hot path.
@@ -46,30 +46,53 @@ Raspberry Pi OS (Debian-based, ARM)
 Python 3.11+
 ```
 
-System packages (apt):
-```bash
-sudo apt install python3-dev python3-venv libportaudio2 libhidapi-hidraw0
-```
+### First-time setup
 
-Python packages (pip into a venv):
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt   # numpy, sounddevice, scipy, hidapi
-```
-
-Install the udev rule so the Pi can access `/dev/hidraw*` without root:
+Run the setup script as the user who will operate the repeater:
 
 ```bash
-sudo cp udev/99-cm119.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
+bash setup.sh
 ```
 
-Add your user to the `audio` group if not already:
+This installs system packages, the udev rule, adds your user to the `audio` group, and creates the Python venv — using sudo only for the steps that require it. Everything else stays inside the project directory.
+
+After the script completes, unplug and replug the CM119, then open a new terminal (or run `newgrp audio`) for the group change to take effect.
+
+To also install and enable the systemd service:
 
 ```bash
-sudo usermod -aG audio $USER
+bash setup.sh --service
 ```
+
+Run `bash setup.sh --help` for details on what each step does.
+
+### Verifying hardware access
+
+After setup, confirm the CM119 is accessible:
+
+```bash
+# Device should appear (vendor 0d8c)
+lsusb | grep 0d8c
+
+# hidraw node should be group-writable by audio
+ls -la /dev/hidraw*
+# Expected: crw-rw---- 1 root audio ...
+
+# Quick open test
+python3 -c "
+import os, select
+fd = os.open('/dev/hidraw0', os.O_RDWR)
+r, _, _ = select.select([fd], [], [], 0.2)
+print(os.read(fd, 4) if r else 'no data (device idle — permissions OK)')
+os.close(fd)
+"
+```
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `/dev/hidraw*` missing | CM119 not plugged in | Check `dmesg \| tail` |
+| `crw-------` (root only) | udev rule not applied | Replug the device after installing rule |
+| Open fails despite correct permissions | Group not active in session | Run `newgrp audio` or open new terminal |
 
 ## Voice vocabulary
 
@@ -116,7 +139,15 @@ set ctcss access cor_ctcss
 
 ## Configuration
 
-Edit `repeater.toml`. Key sections:
+Copy the sample and edit for your site:
+
+```bash
+cp repeater.toml.sample repeater.toml
+```
+
+`repeater.toml` is gitignored — it holds your callsign, hardware device names, and access settings. `repeater.toml.sample` is the committed reference.
+
+Key sections:
 
 ```toml
 [ctcss]
@@ -137,7 +168,7 @@ timeout     = 180.0  # s — TOT cutoff
 id_interval = 600.0  # s — FCC ID interval (≤ 10 min)
 ```
 
-Copy `repeater.toml` to `repeater.local.toml` for site-specific overrides (gitignored).
+Your site config lives in `repeater.toml` (gitignored). The committed `repeater.toml.sample` is the reference template.
 
 ### Messages
 
@@ -168,8 +199,11 @@ elements = [[1000, 0, 50, 0.8], [0, 0, 30, 0.0], [1200, 0, 50, 0.8]]
 
 ## Running as a systemd service
 
+The service runs as your user (edit `User=` and paths in `systemd/rc.service` to match your username). The socket and all runtime files stay inside the project directory — nothing is scattered across the OS.
+
+Install and start:
+
 ```bash
-# Edit systemd/rc.service to match your username and paths
 sudo cp systemd/rc.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable rc
@@ -179,6 +213,8 @@ sudo systemctl start rc
 sudo systemctl status rc
 journalctl -u rc -f
 ```
+
+For manual use (outside systemd), the socket is at `run/rc.sock` inside the project directory — no root needed, nothing outside the project tree.
 
 ## Architecture
 

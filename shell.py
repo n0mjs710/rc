@@ -20,6 +20,14 @@ Commands
   reload              Reload config from disk
   shutdown            Stop the daemon
   subscribe           Subscribe to push events (Ctrl-C to stop)
+  msg list            List all defined messages
+  msg show <name>     Show elements of a message
+  msg new <name>      Create a new empty message
+  msg delete <name>   Delete a message
+  msg clear <name>    Remove all elements from a message
+  msg add <name> cw <text>                    Add a CW element
+  msg add <name> voice <clip>                 Add a voice clip element
+  msg add <name> tone <f1> [f2] <ms> <amp>   Add a tone element
   help                Show this help
   quit / exit         Disconnect
 
@@ -31,6 +39,14 @@ Set examples:
   set morse wpm 20
   set voice level 90
   set ctcss access cor_ctcss
+
+Msg examples:
+  msg new my_id
+  msg add my_id cw W1AW/R
+  msg add my_id voice REPEATER
+  msg add my_id tone 1000 0 80 0.8
+  msg show my_id
+  msg delete my_id
 """
 
 from __future__ import annotations
@@ -146,7 +162,7 @@ def _print_response(resp: dict) -> None:
 
 def _print_config(cfg: dict) -> None:
     for section, values in cfg.items():
-        if section in ("messages", "courtesy_tones"):
+        if section in ("messages",):
             continue
         print(f"\n[{section}]")
         if isinstance(values, dict):
@@ -196,12 +212,109 @@ def watch_mode(conn: DaemonConnection) -> None:
 
 COMMANDS = [
     "state", "config", "set", "play", "ptt", "reload", "shutdown",
-    "subscribe", "watch", "help", "quit", "exit",
+    "subscribe", "watch", "msg", "help", "quit", "exit",
 ]
 
 def _completer(text: str, state: int):
     options = [c for c in COMMANDS if c.startswith(text)]
     return options[state] if state < len(options) else None
+
+
+def _cmd_msg(conn: DaemonConnection, rest: str) -> None:
+    parts = rest.split()
+    if not parts:
+        print("Usage: msg list|show|new|delete|clear|add ...")
+        return
+
+    sub = parts[0].lower()
+
+    if sub == "list":
+        resp = conn.command({"cmd": "msg_list"})
+        if resp.get("ok") is False:
+            print(f"Error: {resp.get('error', '?')}")
+            return
+        msgs = resp.get("messages", {})
+        if not msgs:
+            print("  (no messages defined)")
+        else:
+            for name, types in sorted(msgs.items()):
+                print(f"  {name:<24}  [{', '.join(types) if types else 'empty'}]")
+
+    elif sub == "show":
+        if len(parts) < 2:
+            print("Usage: msg show <name>")
+            return
+        resp = conn.command({"cmd": "msg_show", "name": parts[1]})
+        if resp.get("ok") is False:
+            print(f"Error: {resp.get('error', '?')}")
+            return
+        elems = resp.get("elements", [])
+        if not elems:
+            print("  (empty)")
+        else:
+            for i, e in enumerate(elems):
+                print(f"  [{i}]  {e}")
+
+    elif sub == "new":
+        if len(parts) < 2:
+            print("Usage: msg new <name>")
+            return
+        resp = conn.command({"cmd": "msg_new", "name": parts[1]})
+        _print_response(resp)
+
+    elif sub == "delete":
+        if len(parts) < 2:
+            print("Usage: msg delete <name>")
+            return
+        resp = conn.command({"cmd": "msg_delete", "name": parts[1]})
+        _print_response(resp)
+
+    elif sub == "clear":
+        if len(parts) < 2:
+            print("Usage: msg clear <name>")
+            return
+        resp = conn.command({"cmd": "msg_clear", "name": parts[1]})
+        _print_response(resp)
+
+    elif sub == "add":
+        if len(parts) < 4:
+            print("Usage: msg add <name> cw <text>")
+            print("       msg add <name> voice <clip>")
+            print("       msg add <name> tone <freq1> [freq2] <ms> <amp>")
+            return
+        name  = parts[1]
+        etype = parts[2].lower()
+        tail  = parts[3:]
+
+        if etype == "cw":
+            elem = {"type": "cw", "text": " ".join(tail)}
+        elif etype == "voice":
+            elem = {"type": "voice", "clip": tail[0].upper()}
+        elif etype == "tone":
+            try:
+                if len(tail) == 3:
+                    freq1, ms, amp = tail
+                    freq2 = "0"
+                elif len(tail) == 4:
+                    freq1, freq2, ms, amp = tail
+                else:
+                    print("Usage: msg add <name> tone <freq1> [freq2] <ms> <amp>")
+                    return
+                elem = {"type": "tone", "freq1": float(freq1), "freq2": float(freq2),
+                        "ms": int(ms), "amp": float(amp)}
+            except ValueError as exc:
+                print(f"Invalid tone parameters: {exc}")
+                return
+        else:
+            print(f"Unknown element type {etype!r} — use cw, voice, or tone")
+            return
+
+        resp = conn.command({"cmd": "msg_add", "name": name, "element": elem})
+        _print_response(resp)
+
+    else:
+        print(f"Unknown msg subcommand: {sub!r}")
+        print("Usage: msg list|show|new|delete|clear|add ...")
 
 
 def interactive_shell(conn: DaemonConnection) -> None:
@@ -283,6 +396,9 @@ def interactive_shell(conn: DaemonConnection) -> None:
         elif cmd in ("subscribe", "watch"):
             watch_mode(conn)
 
+        elif cmd == "msg":
+            _cmd_msg(conn, rest)
+
         else:
             print(f"Unknown command: {cmd!r}.  Type 'help' for commands.")
 
@@ -314,9 +430,11 @@ def main() -> None:
         if args.config and Path(args.config).exists():
             from rc_config import RepeaterConfig
             cfg = RepeaterConfig.load(args.config)
-            socket_path = cfg.daemon.socket_path
+            raw = cfg.daemon.socket_path
+            p   = Path(raw)
+            socket_path = raw if p.is_absolute() else str(Path(args.config).parent / p)
         else:
-            socket_path = "/run/rc/rc.sock"
+            socket_path = str(Path.cwd() / "run/rc.sock")
 
     conn = DaemonConnection(socket_path)
     try:

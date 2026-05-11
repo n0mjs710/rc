@@ -62,10 +62,14 @@ class APIServer:
     async def stop(self) -> None:
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                log.warning("Server wait_closed timed out")
         for w in list(self._subscribers):
             try:
                 w.close()
+                await asyncio.wait_for(w.wait_closed(), timeout=1.0)
             except Exception:
                 pass
         self._subscribers.clear()

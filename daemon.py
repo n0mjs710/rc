@@ -71,7 +71,11 @@ class Daemon:
         self._loop = asyncio.get_running_loop()
 
         # Hardware
-        self._hw = CM119Hardware(self.cfg.hardware.hidraw_device)
+        self._hw = CM119Hardware(
+            self.cfg.hardware.hidraw_device,
+            cor_active_low   = self.cfg.hardware.cor_active_low,
+            ctcss_active_low = self.cfg.hardware.ctcss_active_low,
+        )
         self._hw.open()
         log.info("CM119 opened — hidraw: %s",
                  self.cfg.hardware.hidraw_device or "(auto)")
@@ -99,13 +103,19 @@ class Daemon:
 
         # API server
         self._api = APIServer(self.cfg.daemon.socket_path)
-        self._api.register("state",    self._cmd_state)
-        self._api.register("config",   self._cmd_config)
-        self._api.register("set",      self._cmd_set)
-        self._api.register("play",     self._cmd_play)
-        self._api.register("ptt",      self._cmd_ptt)
-        self._api.register("reload",   self._cmd_reload)
-        self._api.register("shutdown", self._cmd_shutdown)
+        self._api.register("state",      self._cmd_state)
+        self._api.register("config",     self._cmd_config)
+        self._api.register("set",        self._cmd_set)
+        self._api.register("play",       self._cmd_play)
+        self._api.register("ptt",        self._cmd_ptt)
+        self._api.register("reload",     self._cmd_reload)
+        self._api.register("shutdown",   self._cmd_shutdown)
+        self._api.register("msg_list",   self._cmd_msg_list)
+        self._api.register("msg_show",   self._cmd_msg_show)
+        self._api.register("msg_new",    self._cmd_msg_new)
+        self._api.register("msg_delete", self._cmd_msg_delete)
+        self._api.register("msg_clear",  self._cmd_msg_clear)
+        self._api.register("msg_add",    self._cmd_msg_add)
         await self._api.start()
 
         log.info("Daemon ready — socket: %s  access: %s",
@@ -126,6 +136,15 @@ class Daemon:
             self._hw.close()
         if self._api:
             await self._api.stop()
+
+        # Cancel any background tasks the port spawned (drain_clips loops, ID
+        # transmissions, etc.) that are still awaiting after hardware is stopped.
+        current = asyncio.current_task()
+        pending = [t for t in asyncio.all_tasks() if t is not current]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
         log.info("Daemon stopped.")
 
@@ -188,6 +207,68 @@ class Daemon:
         self._loop.call_soon(self._shutdown_event.set)
         return {}
 
+    # ── message management ────────────────────────────────────────────────────
+
+    async def _cmd_msg_list(self, msg: dict) -> dict:
+        return {"messages": {
+            name: [e.get("type", "?") for e in elems if isinstance(e, dict)]
+            for name, elems in self.cfg.messages.items()
+        }}
+
+    async def _cmd_msg_show(self, msg: dict) -> dict:
+        name = msg.get("name", "")
+        if not name:
+            return {"error": "no name provided"}
+        elems = self.cfg.messages.get(name)
+        if elems is None:
+            return {"error": f"message '{name}' not found"}
+        return {"name": name, "elements": elems}
+
+    async def _cmd_msg_new(self, msg: dict) -> dict:
+        name = msg.get("name", "")
+        if not name:
+            return {"error": "no name provided"}
+        if name in self.cfg.messages:
+            return {"error": f"message '{name}' already exists"}
+        self.cfg.messages[name] = []
+        log.info("Message created: '%s'", name)
+        return {}
+
+    async def _cmd_msg_delete(self, msg: dict) -> dict:
+        name = msg.get("name", "")
+        if not name:
+            return {"error": "no name provided"}
+        if name not in self.cfg.messages:
+            return {"error": f"message '{name}' not found"}
+        del self.cfg.messages[name]
+        log.info("Message deleted: '%s'", name)
+        return {}
+
+    async def _cmd_msg_clear(self, msg: dict) -> dict:
+        name = msg.get("name", "")
+        if not name:
+            return {"error": "no name provided"}
+        if name not in self.cfg.messages:
+            return {"error": f"message '{name}' not found"}
+        self.cfg.messages[name] = []
+        log.info("Message cleared: '%s'", name)
+        return {}
+
+    async def _cmd_msg_add(self, msg: dict) -> dict:
+        name = msg.get("name", "")
+        elem = msg.get("element")
+        if not name:
+            return {"error": "no name provided"}
+        if not isinstance(elem, dict):
+            return {"error": "element must be a JSON object"}
+        if "type" not in elem:
+            return {"error": "element must have a 'type' field (cw, voice, tone)"}
+        if name not in self.cfg.messages:
+            self.cfg.messages[name] = []
+        self.cfg.messages[name].append(elem)
+        log.info("Element added to '%s': %r", name, elem)
+        return {}
+
     # ── state-change → push event ─────────────────────────────────────────────
 
     def _on_port_state_change(self, status: dict) -> None:
@@ -199,6 +280,15 @@ class Daemon:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve_socket_path(socket_path: str, config_path: str | None) -> str:
+    """Resolve a relative socket path against the config file's directory."""
+    p = Path(socket_path)
+    if p.is_absolute():
+        return socket_path
+    base = Path(config_path).parent if config_path else Path.cwd()
+    return str(base / p)
+
+
 def main() -> None:
     config_path = sys.argv[1] if len(sys.argv) > 1 else None
 
@@ -206,6 +296,9 @@ def main() -> None:
         cfg = RepeaterConfig.load(config_path)
     else:
         cfg = RepeaterConfig()
+
+    # Resolve relative socket path before logging so the log line is accurate
+    cfg.daemon.socket_path = _resolve_socket_path(cfg.daemon.socket_path, config_path)
 
     logging.basicConfig(
         level  = getattr(logging, cfg.daemon.log_level.upper(), logging.INFO),
@@ -220,24 +313,26 @@ def main() -> None:
     loop   = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    main_task: asyncio.Task | None = None
-
-    def _sig_handler(sig, frame):
-        log.info("Signal %s — shutting down", sig)
-        if main_task is not None:
-            main_task.cancel()
-
-    signal.signal(signal.SIGINT,  _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
-
     async def _run():
-        nonlocal main_task
-        main_task = asyncio.current_task()
+        task = asyncio.current_task()
+
+        def _request_shutdown():
+            log.info("Shutdown signal received")
+            task.cancel()
+
+        # Register inside the event loop so handlers fire safely on the loop thread,
+        # avoiding lock contention with logging and asyncio internals.
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT,  _request_shutdown)
+        loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
+
         try:
             await daemon.run()
         except asyncio.CancelledError:
             pass
         finally:
+            loop.remove_signal_handler(signal.SIGINT)
+            loop.remove_signal_handler(signal.SIGTERM)
             await daemon.shutdown()
 
     try:

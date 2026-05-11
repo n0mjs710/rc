@@ -23,14 +23,20 @@ The daemon serves a Unix socket at `/run/rc/rc.sock` (configurable). The shell c
 ## Pi setup
 
 ```bash
-sudo apt install python3-dev python3-venv libportaudio2 libhidapi-hidraw0
-pip install -r requirements.txt     # numpy, sounddevice, scipy, hidapi
+sudo apt install python3-dev python3-venv libportaudio2
+pip install -r requirements.txt     # numpy, sounddevice, scipy
 
 # udev rule for /dev/hidraw* access without sudo
 sudo cp udev/99-cm119.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo udevadm control --reload-rules
 sudo usermod -aG audio $USER
+# Then unplug and replug the CM119 (udev re-evaluates on connect)
+# And open a new terminal or run 'newgrp audio' for the group change to take effect
 ```
+
+Note: `hardware.py` uses direct hidraw file I/O (`/dev/hidraw*`) — no `hidapi` Python package needed. The CM119's HID interface is accessed via the kernel's hidraw driver, which avoids the libusb conflict with `snd_usb_audio`.
+
+Audio device must be explicitly set in config (`audio_device = "USB PnP Sound Device"`). The CM119 only supports 44100 and 48000 Hz; config uses 48000.
 
 `vocab_pcm/` is committed to git (712 WAV files). No regeneration needed after cloning.
 
@@ -55,9 +61,9 @@ sudo usermod -aG audio $USER
 Config is `repeater.toml` (committed — defaults are safe). User-specific overrides go in `repeater.local.toml` (gitignored).
 
 Key sections:
-- `[daemon]` — socket_path, log_level
+- `[daemon]` — socket_path (relative paths resolve from config file's directory; default `run/rc.sock`), log_level
 - `[hardware]` — hidraw_device (empty = auto-detect), audio_device
-- `[audio]` — sample_rate (16000), rx_hpf, rx_deemphasis, tx_preemphasis, repeat_gain, morse/voice levels
+- `[audio]` — sample_rate (48000 — CM119 only supports 44100/48000), rx_hpf, rx_deemphasis, tx_preemphasis, repeat_gain, morse/voice levels
 - `[ctcss]` — access_mode ("cor" or "cor_ctcss")
 - `[timers]` — hang (PTT holdoff/"hangup time"), ct_delay (pre-CT pause), kerchunk, timeout, id_interval
 - `[identity]` — callsign, message rotation lists, ct_message

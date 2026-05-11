@@ -16,19 +16,21 @@ from pathlib import Path
 
 @dataclass
 class DaemonConfig:
-    socket_path: str = "/run/rc/rc.sock"
+    socket_path: str = "run/rc.sock"   # relative paths resolve from config file's directory
     log_level:   str = "INFO"
 
 
 @dataclass
 class HardwareConfig:
-    hidraw_device: str = ""   # empty = auto-detect by VID
-    audio_device:  str = ""   # sounddevice name/index; empty = system default
+    hidraw_device:   str  = ""    # empty = auto-detect by VID
+    audio_device:    str  = ""    # sounddevice name/index; empty = system default
+    cor_active_low:  bool = True  # True = bit clear means COR active (AllStar/chan_usbradio convention)
+    ctcss_active_low: bool = True # True = bit clear means CTCSS active
 
 
 @dataclass
 class AudioConfig:
-    sample_rate:         int   = 16_000
+    sample_rate:         int   = 48_000
     rx_hpf:              bool  = True    # 300 Hz HPF on RX (removes sub-audible)
     rx_deemphasis:       bool  = True    # FM de-emphasis on RX audio
     tx_preemphasis:      bool  = False   # FM pre-emphasis on TX mix
@@ -57,27 +59,15 @@ class TimerConfig:
 
 @dataclass
 class IdentityConfig:
-    callsign:               str  = "N0CALL"
-    initial_ids:            list = field(default_factory=lambda: ["default_cw"])
-    pending_ids:            list = field(default_factory=lambda: ["default_cw"])
-    mandatory_ids:          list = field(default_factory=lambda: ["default_cw"])
-    ct_message:             str  = "hang_ct"
-    timeout_message:        str  = "timeout_warn"
-    timeout_cancel_message: str  = ""  # played when TOT clears; not yet defined
+    startup_message:        str  = ""
+    initial_ids:            list = field(default_factory=list)
+    pending_ids:            list = field(default_factory=list)
+    mandatory_ids:          list = field(default_factory=list)
+    ct_message:             str  = ""
+    timeout_message:        str  = ""
+    timeout_cancel_message: str  = ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Default tone / message pools
-# ─────────────────────────────────────────────────────────────────────────────
-
-from tones import BUILTIN_TONES
-_DEFAULT_COURTESY_TONES: dict[str, list] = BUILTIN_TONES
-
-_DEFAULT_MESSAGES: dict[str, list] = {
-    "default_cw":   [{"type": "cw",   "text": "N0CALL"}],
-    "hang_ct":      [{"type": "tone", "tone": "default"}],
-    "timeout_warn": [{"type": "tone", "tone": "timeout_warn"}],
-}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,7 +96,7 @@ def _dict_to_toml(d: dict) -> str:
         lines.append(f"\n[{name}]")
         for k, v in section.items():
             if isinstance(v, dict):
-                # nested (messages, courtesy_tones sub-tables written inline)
+                # nested sub-tables (e.g. messages) written inline
                 lines.append(f"\n[{name}.{k}]")
                 for kk, vv in v.items():
                     lines.append(f"{kk} = {_toml_val(vv)}")
@@ -141,12 +131,7 @@ class RepeaterConfig:
     ctcss:          CTCSSConfig    = field(default_factory=CTCSSConfig)
     timers:         TimerConfig    = field(default_factory=TimerConfig)
     identity:       IdentityConfig = field(default_factory=IdentityConfig)
-    courtesy_tones: dict = field(
-        default_factory=lambda: {k: list(v) for k, v in _DEFAULT_COURTESY_TONES.items()}
-    )
-    messages: dict = field(
-        default_factory=lambda: {k: list(v) for k, v in _DEFAULT_MESSAGES.items()}
-    )
+    messages:       dict = field(default_factory=dict)
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -158,10 +143,6 @@ class RepeaterConfig:
             "ctcss":    asdict(self.ctcss),
             "timers":   asdict(self.timers),
             "identity": asdict(self.identity),
-            "courtesy_tones": {
-                name: {"elements": elems}
-                for name, elems in self.courtesy_tones.items()
-            },
             "messages": {
                 name: {"elements": elems}
                 for name, elems in self.messages.items()
@@ -189,12 +170,6 @@ class RepeaterConfig:
                 idata["ct_message"] = idata.pop("hang_message")
             cfg.identity = _safe_load(IdentityConfig, idata)
 
-        if "courtesy_tones" in data:
-            cfg.courtesy_tones = {
-                name: tone["elements"]
-                for name, tone in data["courtesy_tones"].items()
-            }
-
         if "messages" in data:
             cfg.messages = {
                 name: [_normalize_element(e) for e in msg.get("elements", [])]
@@ -211,7 +186,7 @@ class RepeaterConfig:
         msg_lines = []
         for name in sorted(c.messages):
             elems    = c.messages[name]
-            elem_str = _elems_display(elems, c.courtesy_tones)
+            elem_str = _elems_display(elems)
             msg_lines.append(f"  {name:<20}  {elem_str}")
 
         lines = [
@@ -222,6 +197,8 @@ class RepeaterConfig:
             "── Hardware ─────────────────────────────────",
             f"  HID device     : {c.hardware.hidraw_device or '(auto-detect)'}",
             f"  Audio device   : {c.hardware.audio_device or '(system default)'}",
+            f"  COR polarity   : {'active-low' if c.hardware.cor_active_low else 'active-high'}",
+            f"  CTCSS polarity : {'active-low' if c.hardware.ctcss_active_low else 'active-high'}",
             "",
             "── Audio ────────────────────────────────────",
             f"  Sample rate    : {a.sample_rate} Hz",
@@ -245,10 +222,10 @@ class RepeaterConfig:
             f"  ID pending     : {t.id_pending:.0f} s before deadline",
             "",
             "── Identity ─────────────────────────────────",
-            f"  Callsign       : {c.identity.callsign}",
             f"  Initial IDs    : {', '.join(c.identity.initial_ids) or '(none)'}",
             f"  Pending IDs    : {', '.join(c.identity.pending_ids) or '(none)'}",
             f"  Mandatory IDs  : {', '.join(c.identity.mandatory_ids) or '(none)'}",
+            f"  Startup msg    : {c.identity.startup_message or '(none)'}",
             f"  CT message     : {c.identity.ct_message or '(none)'}",
             f"  Timeout msg    : {c.identity.timeout_message or '(none)'}",
             f"  Timeout cancel : {c.identity.timeout_cancel_message or '(not configured)'}",
@@ -270,22 +247,18 @@ def _tone_param_str(f1, f2, ms, amp) -> str:
     return f"{_n(f1)}|{_n(f2)}|{int(ms)}|{_n(amp)}"
 
 
-def _elem_display(e: dict, courtesy_tones: dict | None = None) -> str:
+def _elem_display(e: dict) -> str:
     t = e.get("type", "?")
     if t == "cw":    return f'CW:{e.get("text","")}'
     if t == "voice": return f'VOICE:{e.get("clip","")}'
     if t in ("tone", "ct"):
         if "freq1" in e:
             return f'TONE:{_tone_param_str(e["freq1"], e.get("freq2",0), e["ms"], e["amp"])}'
-        tone_name = e.get("tone", "")
-        if courtesy_tones and tone_name in courtesy_tones:
-            params = " ".join(_tone_param_str(*el) for el in courtesy_tones[tone_name])
-            return f'TONE:{params}'
-        return f'TONE:{tone_name}'
+        return f'TONE:?'
     return repr(e)
 
 
-def _elems_display(elems: list[dict], courtesy_tones: dict | None = None) -> str:
+def _elems_display(elems: list[dict]) -> str:
     if not elems:
         return "(empty)"
     parts: list[str] = []
@@ -298,9 +271,6 @@ def _elems_display(elems: list[dict], courtesy_tones: dict | None = None) -> str
         elif norm == "tone":
             if "freq1" in e:
                 val = _tone_param_str(e["freq1"], e.get("freq2",0), e["ms"], e["amp"])
-            elif "tone" in e and courtesy_tones and e["tone"] in courtesy_tones:
-                val = " ".join(_tone_param_str(*el) for el in courtesy_tones[e["tone"]])
-            elif "tone" in e: val = e["tone"]
             else: val = "?"
         else:
             parts.append(repr(e)); prev_type = None; continue
@@ -374,7 +344,6 @@ _ALIASES: list[tuple[set[str], str, str]] = [
     # identity
     ({"ct", "courtesy", "message"},                       "identity", "ct_message"),
     ({"timeout", "message"},                              "identity", "timeout_message"),
-    ({"callsign", "call"},                                "identity", "callsign"),
     # audio
     ({"morse", "speed", "wpm", "cw"},                     "audio",    "morse_wpm"),
     ({"morse", "pitch", "frequency", "freq", "cw"},       "audio",    "morse_pitch"),
@@ -402,7 +371,7 @@ _FIELD_TYPES: dict[str, str] = {
     "morse_level": "float", "voice_level": "float", "repeat_gain": "float",
     "voice_blocks_repeat": "bool", "rx_hpf": "bool",
     "rx_deemphasis": "bool", "tx_preemphasis": "bool",
-    "access_mode": "str", "callsign": "str",
+    "access_mode": "str",
     "ct_message": "str", "timeout_message": "str",
     "hidraw_device": "str", "audio_device": "str",
     "socket_path": "str", "log_level": "str",

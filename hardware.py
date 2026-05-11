@@ -1,26 +1,38 @@
 """
 CM119 USB audio/GPIO hardware driver.
 
+Uses the Linux hidraw kernel interface directly (/dev/hidraw*) — no hidapi
+library required.  hidraw gives non-exclusive access alongside the kernel
+audio driver, which is why libusb-based approaches fail: the kernel's
+snd_usb_audio driver already owns the USB device and libusb cannot claim it.
+
 Supports CM108/CM119/CM119B USB audio devices (Masters Communications,
 RepeaterBuilder, DMK URIx, and similar).  All share the same HID signal
 mapping (AllStar chan_usbradio convention):
 
-  HID input  byte 0 bit 0  — Vol-Down → COR   (set = carrier present)
-  HID input  byte 0 bit 1  — Vol-Up   → CTCSS  (set = tone present)
+  HID input  byte 0 bit 1  — Vol-Up   → COR   (clear = carrier present; active-low)
+  HID input  byte 0 bit 0  — Vol-Down → CTCSS  (clear = tone present; active-low)
   HID output GPIO3 bit 2   — PTT output        (set = TX active)
 
-The reader thread blocks on hid.read() with a short timeout so close() is
+Note: GPIO assignments are board-specific. This mapping (COR on GPIO2/Vol-Up) matches
+the Masters Communications CM119 board. Some boards (e.g. DMK URIx) use the opposite
+assignment (COR on GPIO1/Vol-Down, CTCSS on GPIO2/Vol-Up).
+
+The reader thread blocks in select() with a short timeout so close() is
 responsive.  Callbacks fire edge-triggered (on state change) from that thread;
 they must be fast and non-blocking.
 
 Requirements:
-  pip install hidapi
-  sudo apt install libhidapi-hidraw0
-  udev/99-cm119.rules installed (see repo)
+  udev/99-cm119.rules installed (grants audio group access to /dev/hidraw*)
+  User must be in the 'audio' group (log out and back in after usermod)
 """
 
 from __future__ import annotations
+
+import glob
 import logging
+import os
+import select
 import threading
 from typing import Callable
 
@@ -29,7 +41,7 @@ log = logging.getLogger("hardware")
 
 class CM119Hardware:
     """
-    CM108/CM119-family USB HID driver.
+    CM108/CM119-family USB HID driver via Linux hidraw.
 
     Typical lifecycle:
         hw = CM119Hardware()          # or CM119Hardware("/dev/hidraw0")
@@ -41,50 +53,43 @@ class CM119Hardware:
     """
 
     VID = 0x0d8c             # C-Media Electronics — all CM10x/CM11x PIDs
-    _READ_TIMEOUT_MS = 100   # blocking read interval (controls close() latency)
+    _READ_TIMEOUT_S = 0.1   # select timeout (controls close() latency)
 
     # Input report bitmasks (byte 0 of the 4-byte HID input report)
-    _COR_BIT   = 0x01        # GPIO1 = Vol-Down = COR
-    _CTCSS_BIT = 0x02        # GPIO2 = Vol-Up   = CTCSS decode
+    _COR_BIT   = 0x02        # GPIO2 = Vol-Up   = COR   (board-specific; see module docstring)
+    _CTCSS_BIT = 0x01        # GPIO1 = Vol-Down = CTCSS decode
 
     # Output report GPIO3 bitmask (PTT)
     _PTT_BIT   = 0x04        # GPIO3 = PTT
 
-    def __init__(self, hidraw_device: str = "") -> None:
-        try:
-            import hid
-        except ImportError:
-            raise ImportError(
-                "hidapi not found.  "
-                "Install: pip install hidapi  &&  "
-                "sudo apt install libhidapi-hidraw0"
-            )
-        self._hid             = hid
-        self._path            = hidraw_device.encode() if hidraw_device else None
-        self._device          = None
+    def __init__(self, hidraw_device: str = "",
+                 cor_active_low: bool = True,
+                 ctcss_active_low: bool = True) -> None:
+        self._path            = hidraw_device or ""
+        self._cor_active_low  = cor_active_low
+        self._ctcss_active_low = ctcss_active_low
+        self._fd: int | None  = None
         self._lock            = threading.Lock()
         self._cor_cbs:   list[Callable[[bool], None]] = []
         self._ctcss_cbs: list[Callable[[bool], None]] = []
         self._cor_state:   bool = False
         self._ctcss_state: bool = False
+        self._ptt_active:  bool = False   # tracked so _poll() can re-assert it
         self._stop            = threading.Event()
         self._thread: threading.Thread | None = None
 
     # ── public API ─────────────────────────────────────────────────────────────
 
     def open(self) -> None:
-        """Open the HID device and start the background reader thread."""
-        self._device = self._hid.device()
-        if self._path:
-            self._device.open_path(self._path)
-        else:
-            path = self._autodetect()
-            if path is None:
-                raise RuntimeError(
-                    f"No CM119-compatible HID device found (VID 0x{self.VID:04x}).  "
-                    "Check the udev rule and USB connection."
-                )
-            self._device.open_path(path)
+        """Open the hidraw device and start the background reader thread."""
+        path = self._path or self._autodetect()
+        if path is None:
+            raise RuntimeError(
+                f"No CM119-compatible HID device found (VID 0x{self.VID:04x}).  "
+                "Check USB connection and udev rule."
+            )
+        self._fd = os.open(path, os.O_RDWR)
+        log.info("Opened hidraw device: %s", path)
 
         self._stop.clear()
         self._thread = threading.Thread(
@@ -93,27 +98,30 @@ class CM119Hardware:
         self._thread.start()
 
     def close(self) -> None:
-        """Deassert PTT, stop the reader thread, and close the HID device."""
+        """Deassert PTT, stop the reader thread, and close the hidraw device."""
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
         with self._lock:
-            if self._device is not None:
+            if self._fd is not None:
                 try:
-                    # Deassert PTT before closing so the radio doesn't get stuck transmitting
-                    self._device.write(bytes([0x00, 0x00, self._PTT_BIT, 0x00, 0x00]))
+                    # Ensure PTT is idle before closing so the radio doesn't get stuck transmitting
+                    self._ptt_active = False
+                    self._write_output()
                 except Exception:
                     pass
-                self._device.close()
-                self._device = None
+                try:
+                    os.close(self._fd)
+                except Exception:
+                    pass
+                self._fd = None
 
     def set_ptt(self, active: bool) -> None:
-        """Drive the PTT output (GPIO3) high or low."""
-        val = self._PTT_BIT if active else 0x00
+        """Drive the PTT output (GPIO3) active or idle."""
         with self._lock:
-            if self._device is not None:
-                self._device.write(bytes([0x00, 0x00, self._PTT_BIT, val, 0x00]))
+            self._ptt_active = active
+            self._write_output()
 
     def get_cor(self) -> bool:
         """Return the current COR input state."""
@@ -145,26 +153,67 @@ class CM119Hardware:
 
     # ── internal ───────────────────────────────────────────────────────────────
 
-    def _autodetect(self) -> bytes | None:
-        devs = self._hid.enumerate(self.VID, 0)
-        return devs[0]["path"] if devs else None
+    def _autodetect(self) -> str | None:
+        """Find the CM119 hidraw device via sysfs uevent files."""
+        vid_hex = f"{self.VID:08X}"
+        for uevent_path in glob.glob('/sys/class/hidraw/*/device/uevent'):
+            try:
+                content = open(uevent_path).read()
+                if vid_hex in content.upper():
+                    hidraw_name = uevent_path.split('/')[4]   # 'hidraw0', 'hidraw1', …
+                    return f'/dev/{hidraw_name}'
+            except Exception:
+                continue
+        return None
+
+    def _write_output(self) -> None:
+        """Write the current PTT state as a HID output report (call under _lock).
+
+        Writing an output report causes the CM119 to respond with a fresh
+        interrupt IN report containing the current GPIO input state.  This is
+        used both to set PTT and to poll COR/CTCSS when no unsolicited report
+        has arrived within the select timeout.
+        """
+        if self._fd is None:
+            return
+        val = self._PTT_BIT if self._ptt_active else 0x00
+        try:
+            os.write(self._fd, bytes([0x00, 0x00, self._PTT_BIT, val, 0x00]))
+        except Exception as exc:
+            log.error("HID write error: %s", exc)
 
     def _reader(self) -> None:
         """Blocking HID read loop — runs until close() sets _stop."""
         while not self._stop.is_set():
             try:
-                data = self._device.read(4, timeout_ms=self._READ_TIMEOUT_MS)
+                r, _, _ = select.select([self._fd], [], [], self._READ_TIMEOUT_S)
+                if r:
+                    data = os.read(self._fd, 4)
+                    if data:
+                        self._process(data)
+                else:
+                    # No unsolicited report within the timeout window.
+                    # Writing the current PTT state solicits a fresh input
+                    # report from the CM119, which lets us detect COR/CTCSS
+                    # transitions that the device doesn't report on its own
+                    # (e.g. COR returning to idle when the line is released).
+                    with self._lock:
+                        self._write_output()
             except Exception as exc:
                 log.error("HID read error: %s", exc)
                 break
-            if data:
-                self._process(bytes(data))
 
     def _process(self, data: bytes) -> None:
         """Parse one input report; fire edge callbacks on state change."""
+        log.debug("HID report: %s", data.hex())
         b0        = data[0]
-        new_cor   = bool(b0 & self._COR_BIT)
-        new_ctcss = bool(b0 & self._CTCSS_BIT)
+        raw_cor   = bool(b0 & self._COR_BIT)
+        raw_ctcss = bool(b0 & self._CTCSS_BIT)
+        new_cor   = (not raw_cor)   if self._cor_active_low   else raw_cor
+        new_ctcss = (not raw_ctcss) if self._ctcss_active_low else raw_ctcss
+        log.debug("  b0=0x%02x  COR_bit=%d(raw=%s)→cor=%s  CTCSS_bit=%d(raw=%s)→ctcss=%s",
+                  b0, (b0 & self._COR_BIT) >> 1, raw_cor, new_cor,
+                  b0 & self._CTCSS_BIT, raw_ctcss, new_ctcss)
 
         cor_cbs = ctcss_cbs = []
         cor_val = ctcss_val = False
