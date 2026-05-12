@@ -4,8 +4,10 @@ socket_path = "run/rc.sock"    # relative to this config file's directory
 log_level = "INFO"
 
 [hardware]
-hidraw_device = ""                  # leave empty for auto-detect by USB VID 0x0d8c
-audio_device  = "USB PnP Sound Device"   # must be the same device for duplex RX+TX
+hidraw_device    = ""                     # leave empty for auto-detect by USB VID 0x0d8c
+audio_device     = "USB PnP Sound Device" # must be the same device for duplex RX+TX
+cor_active_low   = true   # true = bit clear means COR active (AllStar/chan_usbradio convention)
+ctcss_active_low = true   # true = bit clear means CTCSS active
 
 [audio]
 sample_rate         = 48000
@@ -16,27 +18,33 @@ repeat_gain         = 1.0     # RX passthrough gain (1.0 = unity)
 morse_wpm           = 20
 morse_pitch         = 700
 morse_level         = 0.9
+impolite_morse_level = 0.3    # CW level when IDing over an active QSO (ducking)
 voice_level         = 0.9
 voice_blocks_repeat = false   # mute RX passthrough while VOICE clips play
+pre_message_ms      = 0       # ms dead air after PTT-on before CW/voice starts (0 = none)
+post_message_ms     = 0       # ms dead air after audio drains before PTT-off (0 = none)
+ste_delay_ms        = 0       # squelch tail elimination delay in ms (0 = disabled)
 
 [ctcss]
 access_mode = "cor"   # "cor" (COR alone) or "cor_ctcss" (both required)
 
 [timers]
-hang        = 2.5     # s — hang time: PTT holdoff after CT (how long before TX "hangs up")
+hang        = 2.5     # s — hang time: PTT holdoff after CT ("hangup time")
 ct_delay    = 0.5     # s — delay from RX stream loss to courtesy tone
 kerchunk    = 0.5     # s — minimum COR hold to respond (anti-kerchunk)
 timeout     = 180.0   # s — time-out timer (TOT) transmit cutoff
 id_interval = 600.0   # s — mandatory ID interval (FCC ≤ 10 min)
-id_pending  = 60.0    # s — queue pending ID this far before deadline
+id_pending  = 60.0    # s — sneak pending ID this far before the mandatory deadline
 
 [identity]
-# Callsign is not a separate config field — define it in your ID messages below.
-initial_ids   = ["default_voice"]
-pending_ids   = ["default_voice"]
-mandatory_ids = ["default_cw"]
-ct_message    = "yellow_jacket"
-timeout_message = "timeout_warn"
+startup_message        = ""              # message played at daemon start; leave empty for none
+initial_ids            = ["default_voice"]
+mandatory_ids          = ["default_cw"]
+pending_id             = ""              # single message; snuck in at COR drop before mandatory deadline
+impolite_id            = ""              # single message; played over active QSO if deadline is hit
+ct_message             = "yellow_jacket"
+timeout_message        = "timeout_warn"
+timeout_cancel_message = ""              # played when TX resumes after a timeout; leave empty for none
 
 [messages.default_cw]
 elements = [{type = "cw", text = "W0ABC/R"}]

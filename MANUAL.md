@@ -1,920 +1,572 @@
 # Repeater Controller — Operator's Manual
 
-A software-defined amateur radio repeater controller written in Python.
-Runs on Raspberry Pi with real GPIO hardware, or on any machine in
-simulation mode for development and testing.
-
 ---
 
-## Table of Contents
+## Design philosophy: shell-first configuration
 
-1. [Overview](#1-overview)
-2. [Installation](#2-installation)
-3. [Quick Start](#3-quick-start)
-4. [The Interactive Shell](#4-the-interactive-shell)
-5. [Configuration](#5-configuration)
-6. [Messages](#6-messages)
-7. [ID System (Telemetry)](#7-id-system-telemetry)
-8. [Simulation](#8-simulation)
-9. [Audio Testing](#9-audio-testing)
-10. [The Live Controller](#10-the-live-controller)
-11. [CTCSS / PL Tone System](#11-ctcss--pl-tone-system)
-12. [Tone Elements](#12-tone-elements)
-13. [Logging](#13-logging)
-14. [Hardware Setup](#14-hardware-setup)
-15. [File Reference](#15-file-reference)
-16. [Appendix A: Vocabulary](#appendix-a-vocabulary)
-17. [Appendix B: Standard CTCSS Tones](#appendix-b-standard-ctcss-tones)
-18. [Appendix C: Troubleshooting](#appendix-c-troubleshooting)
+The shell (`shell.py`) is the **primary configuration interface**. The goal —
+fully realized by v1.0 — is that you never need to hand-edit `repeater.toml`
+after the initial site setup. Everything reachable by `set` or `msg` in the
+shell takes effect immediately on the running daemon. A `save` command will
+write live configuration back to `repeater.toml`, completing the round-trip.
+
+For now, use `repeater.toml` for:
+- Hardware device paths (`hidraw_device`, `audio_device`)
+- Initial ID message content (your callsign in `initial_ids`/`mandatory_ids`)
+- Identity slot assignments (`ct_message`, startup/timeout messages)
+
+Everything else — timers, audio levels, message content — is tunable live
+through the shell without restarting the daemon.
 
 ---
 
 ## 1. Overview
 
-This controller implements a complete repeater state machine with:
+This controller implements a complete repeater state machine targeting
+Raspberry Pi 3+ with CM108/CM119-family USB audio/GPIO interfaces.
 
-- **Six operating states**: IDLE, PENDING, ACTIVE, TAIL, TIMEOUT, TRANSMIT
-- **Four access modes**: COS-only, CTCSS-only, COS+CTCSS, CTCSS-init
-- **Bidirectional PENDING**: In COS+CTCSS modes, either COS or CTCSS may
-  arrive first; the controller waits for the other within a configurable
-  decode window
-- **All-digital audio path**: CTCSS encode/decode, audio passthrough with
-  adjustable gain, tone generation, and clip mixing — all in software via
-  the sounddevice library
-- **FCC-compliant ID system**: Initial, pending, and mandatory IDs with
-  configurable message pools and round-robin rotation
+- **Five operating states**: IDLE, PENDING, ACTIVE, TAIL, TIMEOUT
+- **Two access modes**: COR-only (`cor`) or COR+CTCSS (`cor_ctcss`)
+- **All-digital audio path**: FM de-emphasis, 300 Hz HPF, audio passthrough
+  with adjustable gain, tone generation, and clip mixing via sounddevice
+- **Squelch tail elimination**: Configurable software audio delay (0–500 ms)
+  gates the noise crash before it reaches the TX
+- **FCC-compliant ID system**: Initial, pending, mandatory, and impolite IDs
+  with rotation lists and polite/impolite scheduling
 - **Abstract message system**: Messages are sequences of mixed elements —
   CW (Morse), VOICE (pre-rendered PCM clips), and TONE (synthesized tones)
-  can be freely combined in any order within a single message
-- **Repeat gain control**: RX passthrough level can be scaled up or down
-  before re-transmission, independent of the hardware input trim
-- **Voice-blocks-repeat**: Optional muting of RX passthrough during VOICE
-  clip playback to prevent overlap
-- **Inline tone elements**: Tone elements are defined directly in messages
-  with frequency, duration, and amplitude parameters — supporting dual-tone,
-  silence gaps, and per-element amplitude control
-- **CTCSS squelch tail elimination**: Motorola 120-degree reverse burst and
-  chicken burst modes
-- **GPIO abstraction**: Real Raspberry Pi GPIO or full software simulation
-- **TOML configuration**: Human-readable config files, editable from the
-  interactive shell or any text editor
-- **Structured logging**: INFO, WARNING, and ERROR levels for operational
-  monitoring
+  freely combined in any order
+- **Repeat gain control**: RX passthrough level scalable independently of
+  hardware input trim
+- **TOML configuration**: Human-readable config file; the shell is the
+  primary interface for live changes
+- **Structured logging**: journald-friendly; configurable log level
 - **712 pre-rendered voice clips**: Aviation/radio vocabulary in WAV format,
   plus a `user_pcm/` directory for user-supplied custom clips
 
 ### State Machine
 
 ```
-                    +----------+
-         COS up     |          |  COS too short
-        +---------->| PENDING  +------------+
-        |  (CTCSS   |          |  (kerchunk) |
-        |   modes)  +----+-----+             |
-        |                | both present      |
-        |                v                   |
-   +----+----+    +----------+         +-----v-----+
-   |         |    |          |  TOT    |           |
-   |  IDLE   |    |  ACTIVE  +-------->|  TIMEOUT  |
-   |         |    |          |         |           |
-   +----^----+    +----+-----+         +-----------+
-        |              | COS down
-        |              v
-        |         +----------+
-        |  tail   |          |  CT (tail message)
-        <---------+   TAIL   |<-- hang timer
-        |  timer  |          |
-        |         +----------+
-        |
-   +----+----+
-   |TRANSMIT |  (ID, announcement)
-   +---------+
+                  +----------+
+       COR up     |          |  COR too short
+      +---------->| PENDING  +--------+
+      | (cor_ctcss|          |(kerchunk)
+      |  mode)    +----+-----+        |
+      |                | both present |
+      |                v              |
+ +----+----+    +----------+    +-----v------+
+ |         |    |          | TOT|            |
+ |  IDLE   |    |  ACTIVE  +--->|  TIMEOUT   |
+ |         |    |          |    |            |
+ +----^----+    +----+-----+    +------------+
+      |              | COR down
+      |              v
+      |         +----------+
+      |  hang   |          |  CT plays after ct_delay
+      <---------+   TAIL   |
+        timer   |          |
+                +----------+
 ```
 
-**PENDING is bidirectional.** In `cos_ctcss` and `ctcss_init` modes,
-either COS or CTCSS may arrive first. The controller enters PENDING and
-waits for the other signal within the configured decode window
-(`decode_time_ms`). If the window expires without both signals present,
-the controller returns to IDLE. This correctly handles both wide and
-tight squelch configurations.
+**PENDING (cor_ctcss mode only)**: In `cor_ctcss` mode, either COR or CTCSS
+may arrive first. The controller enters PENDING and waits for the other signal
+within a 500 ms window. If the window expires without both signals present,
+the controller returns to IDLE.
+
+**TIMEOUT**: When the time-out timer (TOT) fires, the RX gate closes and the
+controller plays the timeout message and drops PTT. The repeater ignores any
+incoming signals until the offending COR drops, at which point it transmits a
+timeout-cancel message (if configured) and returns to TAIL → IDLE.
 
 ---
 
 ## 2. Installation
 
-### Requirements
+### Setup script
 
-- Python 3.11 or later
-- A sound card with input and output (for live operation)
-- Raspberry Pi with RPi.GPIO (for real hardware; optional for development)
-
-### Install dependencies
+Run the setup script as the user who will operate the repeater:
 
 ```bash
-cd /path/to/repeater
-pip install -r requirements.txt
+bash setup.sh
 ```
 
-This installs:
-- **numpy** — numerical array processing for audio and DSP
-- **sounddevice** — cross-platform audio I/O (wraps PortAudio)
+This installs system packages (`python3-dev`, `python3-venv`, `libportaudio2`),
+the udev rule for `/dev/hidraw*` access, adds your user to the `audio` group,
+and creates the Python venv. Everything requiring root uses sudo internally;
+everything else stays inside the project directory.
 
-On Raspberry Pi, also install RPi.GPIO if not already present:
+After the script completes, unplug and replug the CM119, then open a new
+terminal (or run `newgrp audio`) for the group change to take effect.
+
+To also install and enable the systemd service:
 
 ```bash
-pip install RPi.GPIO
+bash setup.sh --service
 ```
 
-### Voice clips
+### Verifying hardware access
 
-The 712 pre-rendered voice clips ship in `vocab_pcm/` as 16-bit mono
-WAV files at 16 kHz. No generation step is required — they are ready
-to use.
+```bash
+# Device should appear (vendor 0d8c)
+lsusb | grep 0d8c
 
-To add your own voice content (custom callsigns, phrases, or
-announcements), drop `.wav` files into the `user_pcm/` directory.
-Files in `user_pcm/` take precedence over `vocab_pcm/` when both
-contain a clip with the same name. Clip names are derived from the
-filename (without the `.wav` extension, case-insensitive).
+# hidraw node should be group-writable by audio
+ls -la /dev/hidraw*
+```
 
 ---
 
 ## 3. Quick Start
 
-### Interactive shell (development / configuration)
+### Start the daemon
 
 ```bash
-python3 rc_shell.py
+python daemon.py repeater.toml
 ```
 
-Or load an existing configuration:
+The daemon opens the CM119, starts the audio stream, and serves the Unix
+socket. It runs until stopped (`Ctrl-C` or `shutdown` from the shell).
+
+### Connect the shell
+
+In a second terminal (or another SSH session):
 
 ```bash
-python3 rc_shell.py myrepeater.toml
+python shell.py repeater.toml
 ```
 
-### Live controller (on-air operation)
+The shell connects to the running daemon, subscribes to push events, and
+displays the current state. Multiple shell instances can connect simultaneously.
+
+### Run as a systemd service
 
 ```bash
-python3 controller.py repeater.toml
-```
+sudo systemctl start rc
+sudo systemctl status rc
+journalctl -u rc -f
 
-The controller runs until Ctrl-C. All configuration must be done
-beforehand via the shell or by editing the TOML file directly.
+# After editing code, reload:
+sudo systemctl restart rc
+```
 
 ---
 
-## 4. The Interactive Shell
+## 4. The Shell
 
-The shell is the primary tool for configuring, testing, and simulating
-the repeater. It uses a hierarchical menu system navigable like a Unix
-filesystem.
-
-### Navigation
-
-| Command | Action |
-|---------|--------|
-| `messages` | Build, edit, and delete messages |
-| `telemetry` | Assign messages to functions (ID slots, CT, timeout) |
-| `configure` | System settings (timers, audio, ctcss, hardware) |
-| `simulate` | State machine simulator |
-| `test` | Audio / hardware testing |
-| `back` or `cd ..` | Go up one level |
-| `cd /` | Return to root |
-| `cd configure/timers` | Jump directly to any context |
-| `/configure/audio` | Absolute path as a command |
-| `..` | Shorthand for `cd ..` |
-| `menu` | Show current menu |
-
-### Context-sensitive help
-
-Press **Enter** on an empty line to see what can be configured in the
-current context, with examples:
+The shell is the primary interface for monitoring and configuring the running
+daemon. All commands take effect immediately — no restart needed.
 
 ```
-repeater(configure/timers)>
-  Settable in 'timers'  (use 'set <field> <value>'):
-
-    tail            ms  -- PTT hold after COS drops    (e.g. set tail 2500)
-    hang            ms  -- delay before CT plays        (e.g. set hang 500)
-    timeout         s   -- TOT cutoff                  (e.g. set timeout 180)
-    ...
+rc> state               Show repeater state (IDLE/ACTIVE/TAIL/TIMEOUT)
+rc> config              Show current configuration
+rc> set <field> <val>   Change a config value live (see set examples below)
+rc> play <message>      Trigger a named message (e.g. "play default_cw")
+rc> ptt on|off          Force PTT on or off
+rc> subscribe           Stream state-change events (Ctrl-C to stop)
+rc> reload              Reload repeater.toml from disk
+rc> msg ...             Manage messages (see Messages section)
+rc> shutdown            Stop the daemon
+rc> help                Command reference
+rc> quit                Disconnect
 ```
 
-### Tab completion
+### Set examples
 
-Tab completion works at every menu level for commands, subcommands,
-and navigation targets.
+The `set` command uses natural-language parsing — articles and filler words
+are ignored. A bare number for timer fields uses the natural unit (ms for
+hang/ct_delay/kerchunk, seconds for timeout/id_interval/id_pending).
 
-### Global commands
-
-These work from any context:
-
-| Command | Action |
-|---------|--------|
-| `set <field> <value>` | Set a configuration value |
-| `show` | Show full configuration |
-| `show messages` | List all messages with elements |
-| `show msg <name>` | Show one message's elements |
-| `show vocabulary` | List available VOICE clips |
-| `save [file]` | Save config to TOML |
-| `load <file>` | Load config from TOML |
-| `quit` | Exit |
+```
+set hang 2500             2500 ms hang time
+set hang 2.5s             same as above
+set ct delay 500          500 ms CT delay
+set timeout 3m            3-minute TOT
+set timeout 180           180 seconds TOT
+set id interval 10m       10-minute mandatory ID interval
+set morse wpm 20          Morse code speed
+set morse pitch 700       Morse sidetone frequency
+set morse level 0.9       CW amplitude (0.0–1.0)
+set impolite level 0.3    CW level for mid-QSO impolite IDs
+set voice level 0.9       Voice clip amplitude
+set repeat gain 1.0       RX passthrough gain multiplier
+set voice blocks repeat on   Mute RX during VOICE clips
+set rx hpf on             Enable 300 Hz high-pass filter
+set rx deemphasis on      Enable FM de-emphasis on RX
+set tx preemphasis off    Disable FM pre-emphasis on TX
+set pre message pad 100   100 ms dead air after PTT-on before CW/voice
+set post message pad 50   50 ms dead air after audio drains before PTT-off
+set ste 50                50 ms squelch tail elimination delay
+set ctcss access cor      COR-only access mode
+set ctcss access cor_ctcss  Both COR and CTCSS required
+set log level DEBUG       Increase log verbosity
+```
 
 ---
 
 ## 5. Configuration
 
-All configuration is stored in a TOML file and organized into sections.
+Configuration is stored in `repeater.toml` (gitignored — copy from
+`repeater.toml.sample` for initial setup). The shell is the primary interface
+for live changes; use `reload` to pull TOML changes into a running daemon.
 
-### Setting values
+### `[daemon]`
 
-The `set` command uses natural-language parsing. Articles and filler
-words ("to", "the", "a") are ignored:
+| Field | Default | Description |
+|-------|---------|-------------|
+| `socket_path` | `"run/rc.sock"` | Unix socket path (relative = resolved from config directory) |
+| `log_level` | `"INFO"` | Python logging level: DEBUG, INFO, WARNING, ERROR |
 
-```
-set tail 2500              (bare number = ms for tail/hang/kerchunk)
-set timeout 180            (bare number = seconds for timeout/id timers)
-set timeout 3m             (explicit unit)
-set tail 2.5s              (combined token)
-set morse wpm 20
-set voice volume 80
-set repeat gain 1.5
-set voice blocks on
-set ctcss encode freq 100.0
-set ctcss access ctcss_init
-set mock on
-```
+### `[hardware]`
 
-### Configuration sections
+| Field | Default | Description |
+|-------|---------|-------------|
+| `hidraw_device` | `""` | HID device path; empty = auto-detect by USB VID 0x0d8c |
+| `audio_device` | `""` | sounddevice name; empty = system default |
+| `cor_active_low` | `true` | true = bit clear means COR active (AllStar convention) |
+| `ctcss_active_low` | `true` | true = bit clear means CTCSS active |
 
-#### Timers (`configure/timers`)
+### `[audio]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `sample_rate` | `48000` | Audio sample rate in Hz (CM119 supports 44100 and 48000) |
+| `rx_hpf` | `true` | 300 Hz high-pass filter on RX (removes sub-audible CTCSS/hum) |
+| `rx_deemphasis` | `true` | FM de-emphasis on received audio |
+| `tx_preemphasis` | `false` | FM pre-emphasis on transmitted audio |
+| `repeat_gain` | `1.0` | RX passthrough gain multiplier (1.0 = unity) |
+| `morse_wpm` | `20` | Morse code speed in words per minute |
+| `morse_pitch` | `700` | Morse sidetone frequency in Hz |
+| `morse_level` | `0.9` | CW amplitude (0.0–1.0) |
+| `impolite_morse_level` | `0.3` | CW level when IDing over an active QSO |
+| `voice_level` | `0.9` | VOICE clip amplitude (0.0–1.0) |
+| `voice_blocks_repeat` | `false` | Mute RX passthrough while VOICE clips play |
+| `pre_message_ms` | `0` | Dead air after PTT-on before CW/voice starts |
+| `post_message_ms` | `0` | Dead air after audio drains before PTT-off |
+| `ste_delay_ms` | `0` | Squelch tail elimination delay in ms (0 = disabled, max ~500) |
+
+### `[ctcss]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `access_mode` | `"cor"` | `"cor"` = COR alone; `"cor_ctcss"` = both COR and CTCSS required |
+
+### `[timers]`
 
 | Field | Default | Unit | Description |
 |-------|---------|------|-------------|
-| `tail` | 2500 ms | ms | PTT hold time after COS drops |
-| `hang` | 500 ms | ms | Delay before CT (tail message) plays |
-| `kerchunk` | 500 ms | ms | Minimum COS duration to activate repeater |
-| `timeout` | 180 s | s | Time-out timer (TOT) -- max single transmission |
-| `id_interval` | 600 s | s | Mandatory ID interval (FCC max: 10 minutes) |
-| `id_pending` | 30 s | s | How early to queue a pending ID before deadline |
+| `hang` | `2.5` | s | PTT holdoff after CT ("hangup time") |
+| `ct_delay` | `0.5` | s | Delay from RX stream loss to courtesy tone |
+| `kerchunk` | `0.5` | s | Minimum COR hold to respond (anti-kerchunk) |
+| `timeout` | `180.0` | s | Time-out timer (TOT) transmit cutoff |
+| `id_interval` | `600.0` | s | Mandatory ID interval (FCC max: 10 minutes) |
+| `id_pending` | `60.0` | s | Arm pending ID this far before the mandatory deadline |
 
-For `tail`, `hang`, and `kerchunk`, a bare number is interpreted as
-**milliseconds**. For `timeout`, `id_interval`, and `id_pending`, a bare
-number is interpreted as **seconds**. You can always override with an
-explicit unit: `set tail 2.5s`, `set timeout 3m`.
-
-#### Audio (`configure/audio`)
+### `[identity]`
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `morse_wpm` | 20 | Morse code speed in words per minute |
-| `morse_pitch` | 700 | Morse sidetone frequency in Hz |
-| `morse_volume` | 90 | Morse volume (0-100) |
-| `voice_volume` | 90 | VOICE clip playback level (0-100) |
-| `repeat_gain` | 1.0 | Gain multiplier for RX passthrough before TX |
-| `voice_blocks_repeat` | false | Mute RX passthrough while VOICE clips play |
-| `sample_rate` | 16000 | Audio sample rate in Hz |
-
-**Repeat gain** scales the received audio before re-transmission. If
-the receiver's audio output is too quiet for the transmitter and the DAC
-has headroom, increase `repeat_gain` above 1.0. If the input is too hot,
-reduce it below 1.0. This is independent of the hardware input trim.
-
-**Voice blocks repeat** prevents the received audio from mixing with
-VOICE clip playback. When enabled, the RX passthrough is muted for the
-duration of any VOICE clip. CW and TONE elements do not block passthrough
-unless they are wrapped in a VOICE clip.
-
-#### CTCSS (`configure/ctcss`)
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `access_mode` | ctcss_init | Access activation mode (see [CTCSS](#11-ctcss--pl-tone-system)) |
-| `encode_freq` | 0.0 | TX PL tone frequency (0 = disabled) |
-| `encode_level` | 0.15 | Encode level as fraction of peak deviation |
-| `decode_freq` | 0.0 | Required RX PL tone frequency (0 = disabled) |
-| `decode_time_ms` | 250 | Goertzel integration window in ms |
-| `decode_threshold` | 0.015 | Detection threshold (0-1, normalized) |
-| `decode_hold_ms` | 500 | Hysteresis hold time after tone loss |
-| `ste_mode` | reverse_burst | Squelch tail elimination mode |
-| `chicken_burst_ms` | 200 | Chicken burst: ms CTCSS stops before carrier drops |
-| `reverse_burst_ms` | 250 | Reverse burst: ms duration of 120-degree phase shift |
-
-#### Hardware (`configure/hardware`)
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `mock` | true | true = simulate GPIO, false = real Pi GPIO |
-| `ptt_gpio` | 17 | BCM pin number for PTT output |
-| `cos_gpio` | 27 | BCM pin number for COS input |
-| `cos_invert` | false | true if COS signal is active-low |
-
-### Saving and loading
-
-```
-save                    Save to last-used file (or repeater.toml)
-save myrepeater.toml    Save to specific file
-load myrepeater.toml    Load from file
-```
+| `startup_message` | `""` | Message played at daemon start; leave empty for none |
+| `initial_ids` | `[]` | Rotation list; played at end of hang after first TX from quiet period |
+| `mandatory_ids` | `[]` | Rotation list; played when ID interval expires |
+| `pending_id` | `""` | Single message; sneaked in at COR drop before mandatory deadline |
+| `impolite_id` | `""` | Single message; played over active QSO if deadline hits mid-transmission |
+| `ct_message` | `""` | Courtesy tone message; played after `ct_delay` on COR drop |
+| `timeout_message` | `""` | Played when TOT expires |
+| `timeout_cancel_message` | `""` | Played when TX resumes after a timeout; leave empty for none |
 
 ---
 
 ## 6. Messages
 
-Messages are the central abstraction for all transmitted audio content.
-A message is a named sequence of **elements** that can freely mix three
-types:
+Messages are the central abstraction for all controller audio output. A
+message is a named sequence of **elements**, each of which is one of:
 
-| Element Type | Syntax | Description |
-|--------------|--------|-------------|
-| **CW** | `cw <text>` | Morse code characters |
-| **VOICE** | `voice <clip>` | Pre-rendered PCM clip from `vocab_pcm/` or `user_pcm/` |
-| **TONE** | `tone <freq1> <freq2> <ms> <amplitude>` | A single tone element (see [Tone Elements](#12-tone-elements)) |
+| Type | TOML example | Description |
+|------|--------------|-------------|
+| `cw` | `{type = "cw", text = "W1AW/R"}` | Morse code rendered in-process |
+| `voice` | `{type = "voice", clip = "REPEATER"}` | Pre-rendered PCM clip |
+| `tone` | `{type = "tone", freq1 = 1000, freq2 = 0, ms = 80, amp = 0.8}` | Synthesized tone |
 
-A single message can contain any combination of these. For example, a
-message could play a tone element, then a voice clip, then Morse code.
-
-### Message management commands
-
-| Command | Action |
-|---------|--------|
-| `msg list` | List all messages with their elements |
-| `msg show <name>` | Show one message's elements in detail |
-| `msg new <name>` | Create an empty message |
-| `msg add <name> cw <text>` | Append a CW (Morse) element |
-| `msg add <name> voice <clip>` | Append a VOICE clip element |
-| `msg add <name> tone <f1> <f2> <ms> <amp>` | Append a TONE element |
-| `msg clear <name>` | Remove all elements from a message |
-| `msg edit <name>` | Interactive element editor (add/delete elements) |
-| `msg delete <name>` | Delete a message and remove from all slots |
-
-### Examples
-
-Create a mixed CW + VOICE ID message:
-
-```
-msg new my_id
-msg add my_id voice THIS
-msg add my_id voice IS
-msg add my_id cw W1AW
-msg add my_id voice REPEATER
-```
-
-Create a message that plays a tone pip followed by a voice clip:
-
-```
-msg new post_id
-msg add post_id tone 1000 0 80 0.8
-msg add post_id voice FREQUENCY
-msg add post_id voice ONE
-msg add post_id voice FOUR
-msg add post_id voice SIX
-msg add post_id voice POINT
-msg add post_id voice NINE
-msg add post_id voice ZERO
-```
-
-Shorthand for single-element messages (via the `id` command):
-
-```
-id add my_cw cw W1AW/R
-id add my_voice voice REPEATER
-id add my_ct tone 1000 0 80 0.8
-```
+A single message can freely mix all three types in any order.
 
 ### TOML format
-
-Messages are stored in the configuration file under `[messages.<name>]`:
 
 ```toml
 [messages.my_id]
 elements = [
-    {type = "cw", text = "W1AW"},
-    {type = "voice", clip = "REPEATER"},
-    {type = "tone", freq1 = 1000, freq2 = 0, ms = 80, amp = 0.8},
+  {type = "voice", clip = "THIS"},
+  {type = "voice", clip = "IS"},
+  {type = "cw",    text = "W1AW"},
+  {type = "voice", clip = "REPEATER"},
 ]
 ```
 
-### Future element types
+### Shell `msg` commands
 
-- **time** — System clock readback (day, date, time). The element type
-  is recognized but not yet implemented. When completed, this will
-  generate VOICE clips for the current time, date, day of week, day of
-  month, and month of year from the system clock.
+```
+msg list                      List all messages with element types
+msg show <name>               Show one message's elements in detail
+msg new <name>                Create an empty message
+msg add <name> cw <text>      Append a CW (Morse) element
+msg add <name> voice <clip>   Append a VOICE clip element
+msg add <name> tone <f1> [f2] <ms> <amp>   Append a TONE element
+msg clear <name>              Remove all elements from a message
+msg delete <name>             Delete a message
+```
 
-Other planned message types include timeout messages, OTA telemetry,
-tail messages, and error-level log readback.
+### Example: mixed CW + VOICE ID
+
+```
+rc> msg new my_id
+rc> msg add my_id voice THIS
+rc> msg add my_id voice IS
+rc> msg add my_id cw W1AW
+rc> msg add my_id voice REPEATER
+```
+
+### Example: courtesy tone
+
+```
+rc> msg new my_ct
+rc> msg add my_ct tone 330 0 50 0.7
+rc> msg add my_ct tone 495 0 50 0.7
+rc> msg add my_ct tone 660 0 50 0.7
+```
+
+### Example: announce frequency
+
+```
+rc> msg new freq_announce
+rc> msg add freq_announce voice FREQUENCY
+rc> msg add freq_announce voice ONE
+rc> msg add freq_announce voice FOUR
+rc> msg add freq_announce voice SIX
+rc> msg add freq_announce voice POINT
+rc> msg add freq_announce voice NINE
+rc> msg add freq_announce voice MEGAHERTZ
+```
 
 ---
 
-## 7. ID System (Telemetry)
+## 7. Station Identification
 
-The controller implements FCC-compliant station identification with
-three ID types and two special message slots. Message assignments are
-managed in the `telemetry` menu.
+The controller implements FCC Part 97 identification requirements automatically.
+Your station ID is simply the content of whatever CW and VOICE elements you
+put in your messages — there is no separate callsign field.
 
 ### ID types
 
 | Type | When it fires |
 |------|---------------|
-| **Initial** | First activation after the repeater has been idle longer than `id_interval` |
-| **Pending** | `id_pending` seconds before the mandatory deadline, giving the controller a chance to ID during a pause |
-| **Mandatory** | Every `id_interval` seconds (FCC requires at least every 10 minutes during operation) |
-
-### Special message slots
-
-| Slot | When it fires |
-|------|---------------|
-| **CT** | Courtesy tone (tail message) — plays when the hang timer expires |
-| **Timeout** | When the time-out timer (TOT) expires |
+| **Initial** | End of hang after the first TX from a quiet period (polite: waits for QSO to end) |
+| **Pending** | At COR drop before the CT when `id_pending` seconds remain before the mandatory deadline |
+| **Mandatory** | When `id_interval` expires with TX activity since the last ID |
+| **Impolite** | When the mandatory deadline hits while a QSO is in progress (ducked CW level) |
 
 ### Rotation
 
-Each ID type (initial, pending, mandatory) has a rotation list.
-Messages in the list are played round-robin each time that type fires.
-This lets you alternate between different ID styles automatically.
+`initial_ids` and `mandatory_ids` are lists of message names played
+round-robin. The pending and impolite slots are single messages (no rotation).
 
-### Managing rotations
+### Quiet period
 
-The `assign` and `unassign` commands are top-level commands available
-from any context:
+If no transmission has occurred since the last ID, the `id_interval` timer
+expires silently — no unnecessary transmission.
 
-```
-assign my_cw mandatory            Add to mandatory rotation
-assign my_voice pending           Add to pending rotation
-assign my_cw initial              Add to initial rotation
-assign my_ct ct                   Set as courtesy tone (tail message)
-assign timeout_warn timeout       Set as timeout message
-unassign my_cw mandatory          Remove from mandatory rotation
-unassign my_cw                    Remove from all slots
-```
+### Impolite ID interruption
 
-### Example setup
-
-```
-msg new main_cw
-msg add main_cw cw W1AW/R
-
-msg new voice_id
-msg add voice_id voice THIS
-msg add voice_id voice IS
-msg add voice_id cw W1AW
-msg add voice_id voice REPEATER
-
-msg new short_cw
-msg add short_cw cw W1AW
-
-assign main_cw mandatory
-assign voice_id mandatory
-assign short_cw pending
-assign main_cw initial
-```
-
-With this setup:
-- Mandatory IDs alternate between a full CW ID and a mixed voice+CW ID
-- Pending IDs use the short CW ID
-- Initial IDs use the full CW ID
-
-The system does not use a "callsign" field. Your callsign is simply
-the content of whatever CW and VOICE elements you put in your messages.
+If a voice ID is in progress when incoming COR asserts (new station keys up),
+the voice ID is cancelled and an impolite CW-only ID (at `impolite_morse_level`)
+is played over the active QSO. The ID cycle resets from the impolite ID.
 
 ---
 
-## 8. Simulation
+## 8. Tone Elements
 
-The simulator models the full repeater state machine without any
-hardware. Use it to verify your configuration and understand the
-controller's behavior.
-
-### Entering simulation mode
-
-```
-simulate
-```
-
-### Simulation commands
-
-These commands work from the simulate menu or from any context:
-
-| Command | Action |
-|---------|--------|
-| `cos up` | Simulate carrier detect (radio keyed) |
-| `cos down` | Simulate carrier drop (radio unkeyed) |
-| `ctcss on` | Simulate CTCSS tone detected |
-| `ctcss off` | Simulate CTCSS tone lost |
-| `dtmf <digit>` | Simulate DTMF digit received |
-| `advance <seconds>` | Advance simulated clock (fires pending timers) |
-| `id` | Fire mandatory ID now |
-| `id initial` | Fire initial ID now |
-| `id pending` | Fire pending ID now |
-| `status` | Show current simulator state |
-| `log` | Show full event timeline |
-| `reset` | Reset simulator to IDLE |
-
-### Example: COS arrives first (wide squelch)
-
-```
-repeater(simulate)> cos up
-  [00:00]  COS first -- waiting for CTCSS (250 ms window)
-  [00:00]  State: IDLE -> PENDING  [PENDING]
-
-repeater(simulate)> ctcss on
-  [00:00]  CTCSS confirmed (100.0 Hz)
-  [00:00]  PTT ON  <- transmitter keyed
-  [00:00]  State: PENDING -> ACTIVE  [ACTIVE]
-```
-
-### Example: CTCSS arrives first (tight squelch)
-
-```
-repeater(simulate)> ctcss on
-  [00:00]  CTCSS confirmed (100.0 Hz)
-  [00:00]  CTCSS first -- waiting for COS (250 ms window)
-  [00:00]  State: IDLE -> PENDING  [PENDING]
-
-repeater(simulate)> cos up
-  [00:00]  PTT ON  <- transmitter keyed
-  [00:00]  State: PENDING -> ACTIVE  [ACTIVE]
-```
-
-### Example: Full QSO cycle
-
-```
-repeater(simulate)> cos up
-repeater(simulate)> ctcss on
-  ... (ACTIVE)
-
-repeater(simulate)> advance 5
-  Clock advanced 5.0s -- no timer events fired
-
-repeater(simulate)> cos down
-  [00:05]  State: ACTIVE -> TAIL  [TAIL]
-  [00:05]  Tail timer: 2500 ms
-
-repeater(simulate)> advance 0.5
-  [00:05]  CT: playing message 'hang_ct'
-  [00:05]  > AUDIO: TONE: 'default'
-
-repeater(simulate)> advance 3
-  [00:08]  STE: 120 degree reverse burst (250 ms)
-  [00:08]  PTT OFF <- transmitter unkeyed
-  [00:08]  State: TAIL -> IDLE  [IDLE]
-```
-
----
-
-## 9. Audio Testing
-
-The test menu plays real audio through your sound card. Use it to
-verify Morse, VOICE clips, and courtesy tones sound correct.
-
-| Command | Action |
-|---------|--------|
-| `play id` | Play next mandatory ID (advances rotation) |
-| `play id <name>` | Play a named message directly |
-| `play id initial` | Play next initial ID |
-| `play morse <text>` | Play arbitrary Morse text |
-| `play voice <clip>` | Play a VOICE clip by name |
-| `play ct` | Play the configured courtesy tone (tail message) |
-| `show vocabulary` | List all available VOICE clips |
-| `gpio` | Show GPIO pin assignments |
-
-### Adding custom voice clips
-
-Drop `.wav` files into `user_pcm/` to add your own voice content.
-Requirements:
-- **Format**: 16-bit mono WAV
-- **Sample rate**: 16 kHz recommended (other rates are resampled automatically)
-- **Naming**: The filename (without `.wav`) becomes the clip name.
-  For example, `user_pcm/MYCALL.wav` is referenced as `voice MYCALL`.
-
-Clips in `user_pcm/` override same-named clips in `vocab_pcm/`.
-Use `show vocabulary` to see all available clips and their source directory.
-
----
-
-## 10. The Live Controller
-
-The live controller (`controller.py`) runs the full state machine with
-real audio and GPIO hardware.
-
-### Starting
-
-```bash
-python3 controller.py repeater.toml
-```
-
-Or with default configuration (mock hardware):
-
-```bash
-python3 controller.py
-```
-
-### What it does
-
-1. Opens a duplex audio stream (sounddevice)
-2. Configures GPIO pins (PTT output, COS input)
-3. Runs the state machine in an asyncio event loop
-4. Monitors COS edges via GPIO interrupts
-5. Decodes CTCSS from the RX audio stream in real time
-6. Encodes CTCSS onto the TX audio stream
-7. Manages all timers (tail, hang, timeout, ID)
-8. Plays messages (mixed CW, VOICE, TONE elements)
-9. Applies repeat gain to RX passthrough
-10. Optionally mutes passthrough during VOICE playback
-11. Detects and warns on ADC clipping
-
-### Stopping
-
-Press **Ctrl-C** to shut down gracefully.
-
----
-
-## 11. CTCSS / PL Tone System
-
-### Access modes
-
-| Mode | Behavior |
-|------|----------|
-| `cos` | COS alone activates the repeater. CTCSS is ignored. |
-| `ctcss` | CTCSS alone controls activation. COS is informational. |
-| `cos_ctcss` | Both COS and CTCSS must be present. Either may arrive first. CTCSS loss forces tail even if COS remains. |
-| `ctcss_init` | Both COS and CTCSS required to initially activate. Either may arrive first. Once active, COS alone maintains; CTCSS loss is logged but does not force tail. |
-
-**Bidirectional PENDING**: In `cos_ctcss` and `ctcss_init` modes, the
-controller does not assume COS will always arrive before CTCSS. With a
-tight squelch, CTCSS may be decoded before the squelch opens. The
-controller handles both orderings identically: whichever signal arrives
-first puts the machine in PENDING and starts the decode window timer.
-The other signal must arrive before the window expires or the controller
-returns to IDLE.
-
-### CTCSS decode
-
-The decoder uses a **Goertzel algorithm** (single-frequency DFT) to
-detect the sub-audible tone in the RX audio stream:
-
-- **Integration window** (`decode_time_ms`): How many milliseconds of
-  audio to analyze per detection cycle. Shorter = faster but less
-  accurate. 250 ms is typical.
-- **Threshold** (`decode_threshold`): Normalized power level (0-1) above
-  which the tone is considered present. A pure tone yields 1.0.
-  Default 0.015 works well for real-world signals.
-- **Hold time** (`decode_hold_ms`): How long to maintain "tone present"
-  after the last detection, preventing false drops during brief fades.
-
-### Squelch tail elimination (STE)
-
-When the repeater drops from TAIL to IDLE, it can suppress the squelch
-burst heard on receivers:
-
-| Mode | Description |
-|------|-------------|
-| `none` | No STE. Receivers hear a brief squelch burst. |
-| `reverse_burst` | Motorola standard: shift CTCSS phase by 120 degrees for a brief burst before dropping carrier. Receivers detect the phase shift and mute before carrier drops. |
-| `chicken_burst` | Stop the CTCSS tone a few hundred ms before dropping carrier. Receivers lose tone lock and mute before carrier drops. |
-
----
-
-## 12. Tone Elements
-
-Tone elements produce synthesized audio within a message. Each tone
-element is defined inline with four parameters:
+Tone elements produce synthesized audio within a message. Each element is
+defined inline with four parameters:
 
 | Parameter | Description |
 |-----------|-------------|
 | `freq1` | Primary frequency in Hz (0 = silence) |
-| `freq2` | Secondary frequency in Hz (0 = single tone) |
+| `freq2` | Secondary frequency in Hz (0 = single-frequency tone) |
 | `ms` | Duration in milliseconds |
 | `amp` | Amplitude from 0.0 (silent) to 1.0 (full scale) |
 
-### Adding tone elements to messages
+When both `freq1` and `freq2` are non-zero, both frequencies are summed
+(useful for DTMF-style dual-tone chords).
 
-Use the `msg add` command with all four parameters:
+### Classic patterns
 
-```
-msg add my_message tone 1000 0 80 0.8
-```
-
-To create a silence gap between tones, set freq1 to 0:
-
-```
-msg add my_message tone 0 0 30 0.0
-```
-
-When both freq1 and freq2 are non-zero, a dual-frequency tone is
-produced (both frequencies are summed). This is useful for DTMF-style
-chords:
-
-```
-msg add my_message tone 697 1209 150 0.75
-```
-
-### TOML format
-
-In the configuration file, tone elements use explicit field names:
-
+**Ascending three-pip (yellow jacket)**:
 ```toml
-{type = "tone", freq1 = 1000, freq2 = 0, ms = 80, amp = 0.8}
+{type = "tone", freq1 = 330, freq2 = 0, ms = 50, amp = 0.7}
+{type = "tone", freq1 = 495, freq2 = 0, ms = 50, amp = 0.7}
+{type = "tone", freq1 = 660, freq2 = 0, ms = 50, amp = 0.7}
 ```
 
-### Classic tone patterns
-
-Courtesy tones and alert sequences are built by adding multiple tone
-elements to a message. Here are some common patterns:
-
-**Ascending two-pip** (classic courtesy tone):
-
-```
-msg new my_ct
-msg add my_ct tone 1000 0 50 0.8
-msg add my_ct tone 0 0 30 0.0
-msg add my_ct tone 1200 0 50 0.8
+**Descending three-tone timeout warning**:
+```toml
+{type = "tone", freq1 = 1200, freq2 = 0, ms = 60, amp = 0.9}
+{type = "tone", freq1 = 0,    freq2 = 0, ms = 20, amp = 0.0}
+{type = "tone", freq1 = 1000, freq2 = 0, ms = 60, amp = 0.9}
+{type = "tone", freq1 = 0,    freq2 = 0, ms = 20, amp = 0.0}
+{type = "tone", freq1 = 800,  freq2 = 0, ms = 60, amp = 0.9}
 ```
 
-**Descending three-tone alert** (timeout warning):
-
-```
-msg new my_warn
-msg add my_warn tone 1200 0 60 0.9
-msg add my_warn tone 0 0 20 0.0
-msg add my_warn tone 1000 0 60 0.9
-msg add my_warn tone 0 0 20 0.0
-msg add my_warn tone 800 0 60 0.9
-```
-
-**Rising three-tone**:
-
-```
-msg new rising
-msg add rising tone 800 0 40 0.8
-msg add rising tone 0 0 20 0.0
-msg add rising tone 1000 0 40 0.8
-msg add rising tone 0 0 20 0.0
-msg add rising tone 1200 0 40 0.8
-```
-
-**Single pip**:
-
-```
-msg new pip
-msg add pip tone 1000 0 80 0.8
-```
-
-Tone elements can be freely mixed with CW and VOICE elements in the
-same message. The CT slot is typically assigned a message containing
-tone elements:
-
-```
-assign my_ct ct
+**Dual-frequency chord**:
+```toml
+{type = "tone", freq1 = 660, freq2 = 880, ms = 100, amp = 0.7}
 ```
 
 ---
 
-## 13. Logging
+## 9. Squelch Tail Elimination
 
-The controller uses Python's standard `logging` module with three
-severity levels:
+When a user unkeys, the hardware COR/CTCSS decoder has 25–150 ms of
+hysteresis before it drops — during which FM noise exits the receiver
+discriminator. Without STE, that noise crash passes through to the TX.
 
-### INFO — Routine operations
-
-All normal state transitions and actions:
-- State changes (IDLE -> PENDING -> ACTIVE -> TAIL -> IDLE)
-- PTT on/off
-- COS up/down with duration
-- CTCSS detected/lost
-- ID timer fires and message playback
-- Clip playback (CW, VOICE, TONE)
-- Audio stream start/stop
-
-### WARNING — Service-impacting events
-
-Things that affect quality but don't prevent operation:
-- ADC clipping on RX input (rate-limited to once per 5 seconds)
-- CTCSS decode window timeout (PENDING expired without both signals)
-- Empty message elements
-- Missing voice directories
-
-### ERROR — Operational failures
-
-Problems that prevent a message or function from working correctly:
-- Message not found in pool when ID fires
-- Unknown element type in a message
-- Missing `text`, `clip`, or `tone` field in an element
-- Courtesy tone name not found
-- Voice clip not found in any directory
-- Morse playback subprocess failure
-
-### Log format
+`ste_delay_ms` introduces a software FIFO delay between the RX filter chain
+and the passthrough gate. The gate still operates on real-time hardware signal
+edges. When the gate closes, the delay buffer is abandoned — the noise burst
+that entered the ADC after the user unkeyed is in the queue but never exits.
 
 ```
-HH:MM:SS  LEVEL    module  message
-14:30:01  INFO     controller  State: IDLE -> ACTIVE
-14:30:01  INFO     controller  PTT ON
-14:35:01  INFO     controller  ID (mandatory) -> 'main_cw'
-14:35:01  INFO     controller  CW: 'W1AW/R'  20 WPM  700 Hz
-14:42:15  WARNING  audio       ADC clipping on RX input -- peak 0.991 FS
+set ste 50      50 ms delay (moderate hysteresis)
+set ste 0       disabled (default)
 ```
+
+Typical values: 25–150 ms. Set to roughly match your hardware's COR/CTCSS
+decoder hysteresis. Higher values increase startup latency at the beginning
+of each transmission (hidden by CTCSS decode time on the receiving radio).
 
 ---
 
-## 14. Hardware Setup
+## 10. Pre/Post Message Padding
 
-### Raspberry Pi GPIO wiring
+For standalone ID transmissions (where the repeater brings up PTT specifically
+to identify), `pre_message_ms` and `post_message_ms` add dead air:
 
-| Function | Default Pin | Direction | Description |
-|----------|-------------|-----------|-------------|
-| PTT | GPIO 17 | Output | Drives the transmitter PTT line |
-| COS | GPIO 27 | Input | Receives carrier-operated squelch signal |
+- **Pre**: After PTT-on, before the first CW or voice sample — gives the
+  transmitter time to stabilize and receivers time to open squelch/decode CTCSS
+- **Post**: After all audio drains, before PTT-off — prevents a "clipped" tail
 
-Pin numbers use **BCM numbering** (not physical pin numbers).
+These delays apply only to CW and voice elements (not tone-only messages) and
+only when PTT was not already on. They are no-ops for courtesy tones,
+mid-QSO impolite IDs, and pending IDs.
 
-### COS polarity
+---
 
-Most radios drive COS high when a signal is present. If your radio
-drives COS low on carrier detect, set:
+## 11. Logging
 
-```
-set cos invert on
-```
-
-### Mock mode
-
-For development without a Pi:
+The daemon uses Python's standard `logging` module with journald-friendly
+output. Log level is configurable: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
 
 ```
-set mock on       Simulate GPIO (no real hardware needed)
-set mock off      Use real RPi.GPIO (Pi only)
+set log level DEBUG      Verbose; includes every HID byte and audio block event
+set log level INFO       Normal operation (default)
+set log level WARNING    Service-impacting events only
 ```
+
+**INFO-level events**: State transitions, PTT on/off, COR up/down with
+duration, CTCSS detected/lost, ID timer fires, message playback, clip queue.
+
+**WARNING-level events**: ADC clipping (rate-limited), PENDING timeout (in
+`cor_ctcss` mode, when the second signal doesn't arrive in time).
+
+**ERROR-level events**: Missing messages, unknown element types, voice clips
+not found.
+
+---
+
+## 12. Hardware Reference
+
+### CM108/CM119 signal mapping
+
+| Signal | Direction | HID / Audio path |
+|--------|-----------|-----------------|
+| COR | Input | HID Vol-Up bit (byte 0, bit 1, 0x02) |
+| CTCSS | Input | HID Vol-Down bit (byte 0, bit 0, 0x01) |
+| PTT | Output | HID GPIO3 bit (output report, bit 2) |
+| RX audio | Input | USB audio mic channel (discriminator output) |
+| TX audio | Output | USB audio left speaker channel |
+
+The right audio output channel is reserved for a future CTCSS encode tone.
+
+### Signal polarity
+
+The default `cor_active_low = true` / `ctcss_active_low = true` matches the
+AllStar `chan_usbradio` convention (Masters Communications CM119 boards).
+Some interfaces (e.g., DMK URIx) swap the bit assignments — set the
+appropriate `_active_low` flag to match your hardware.
 
 ### Audio connections
 
-The controller uses the system's default audio input and output devices
-via sounddevice/PortAudio:
+- **Input**: Receiver discriminator tap or speaker output → CM119 mic input
+- **Output**: CM119 left speaker output → transmitter audio input (mic or aux)
 
-- **Input**: Connect receiver audio (discriminator tap or speaker output)
-- **Output**: Connect to transmitter audio input (mic input or aux)
-
-Audio runs at 16 kHz sample rate with 20 ms block size for low latency.
-
-If the receiver's audio level doesn't match the transmitter's needs,
-adjust `repeat_gain`:
-
-```
-set repeat gain 1.5     Boost RX audio 50% before re-transmission
-set repeat gain 0.8     Reduce RX audio 20%
-```
+The CM119 only supports 44100 and 48000 Hz sample rates. The controller uses
+48000 Hz.
 
 ---
 
-## 15. File Reference
+## 13. File Reference
 
 ### Core modules
 
 | File | Purpose |
 |------|---------|
-| `controller.py` | Live asyncio state machine — the on-air controller |
-| `rc_shell.py` | Interactive configuration and simulation shell |
-| `rc_config.py` | Configuration dataclass, TOML load/save, set parser |
-| `audio_engine.py` | Sounddevice duplex stream, clip mixer, CTCSS pipeline |
-| `ctcss.py` | CTCSS encoder, Goertzel decoder, STE helpers |
-| `hardware.py` | GPIO abstraction (MockHardware / RealHardware) |
-| `tones.py` | Courtesy tone renderer and player |
-| `morse.py` | Morse code audio generator |
+| `daemon.py` | Entry point — wires hardware, audio, port, and API server |
+| `shell.py` | Operator CLI — connects to daemon via Unix socket |
+| `port.py` | State machine — IDLE/PENDING/ACTIVE/TAIL/TIMEOUT, timers, ID scheduling |
+| `api_server.py` | Unix socket server — JSON-lines protocol, push events |
+| `audio_engine.py` | Duplex sounddevice stream — clip queue, RX/TX filter chain, STE |
+| `audio_filters.py` | HPF300, DeEmphasis, PreEmphasis (scipy.signal IIR filters) |
+| `hardware.py` | CM119 HID reader thread, PTT/COR/CTCSS callbacks |
+| `rc_config.py` | TOML config model, `apply_set_command()` for shell set commands |
+| `tones.py` | Tone synthesis (single and dual frequency, numpy-rendered) |
+| `morse.py` | CW synthesis — `render()` for in-process use, CLI for standalone |
+| `ctcss.py` | Goertzel CTCSS decode (retained for future use; not currently active) |
 
 ### Voice clip directories
 
 | Path | Purpose |
 |------|---------|
-| `vocab_pcm/` | Built-in voice clips (712 WAV files, 16-bit mono, 16 kHz) |
+| `vocab_pcm/` | Built-in voice clips (712 WAV files, 8-bit mono, 8 kHz) |
 | `user_pcm/` | User-supplied voice clips (takes precedence over vocab_pcm) |
 
 ### Configuration
 
 | Path | Purpose |
 |------|---------|
-| `repeater.toml` | Configuration file (created/updated by `save`) |
-
-### Support files
-
-| File | Purpose |
-|------|---------|
-| `requirements.txt` | Python package dependencies |
-| `MANUAL.md` | This manual |
+| `repeater.toml` | Site configuration (gitignored; copy from repeater.toml.sample) |
+| `repeater.toml.sample` | Reference template with defaults and comments |
 
 ---
 
 ## Appendix A: Vocabulary
 
-The `vocab_pcm/` directory contains 712 pre-rendered voice clips
-(the vocabulary). These can be used in VOICE elements within messages.
-Clip names are case-insensitive (referenced in uppercase internally).
+The `vocab_pcm/` directory contains 712 pre-rendered voice clips covering
+aviation, radio, and general vocabulary. These clips are sourced from the
+original **Texas Instruments speech synthesizer library** used in the famous
+repeater controllers of the 1980s and 1990s (most notably the NHRC and
+similar controllers of that era) — included here as a deliberate nod to
+the controllers many of us grew up hearing on the air.
 
-To use a clip in a message, the corresponding `.wav` file must exist in
-either `vocab_pcm/` or `user_pcm/`. Missing clips are logged as errors
-and skipped. Use `show vocabulary` in the shell to list all available
-clips.
+Clips are 8-bit mono WAV files at 8 kHz. They are committed to the repository
+and require no generation step.
+
+**You can replace any clip** by placing a same-named `.wav` file in `user_pcm/`.
+Files in `user_pcm/` take precedence over `vocab_pcm/` when names match.
+You can also build an entirely custom vocabulary by populating `user_pcm/`
+with your own recordings — record your callsign, local landmarks, anything
+you like. The only requirement is 16-bit or 8-bit mono WAV format; the audio
+engine handles sample-rate conversion.
+
+Clip names are case-insensitive and derived from the filename without the
+`.wav` extension. Use `msg show <name>` in the shell or check the
+`vocab_pcm/` directory for the exact set available.
 
 ```
 A           ABORT       ABOUT       ABOVE       ACCELERATED
@@ -1030,12 +682,6 @@ YESTERDAY   YOU         YOUR        Z           ZERO
 ZONE        ZULU
 ```
 
-Not every variant is listed above; see the `vocab_pcm/` directory for
-the exact filenames available, or use `show vocabulary` in the shell.
-
-To add clips not in this list (custom callsigns, local phrases, etc.),
-record them as 16-bit mono WAV files and place them in `user_pcm/`.
-
 ---
 
 ## Appendix B: Standard CTCSS Tones
@@ -1050,102 +696,70 @@ Standard EIA/TIA-603 CTCSS (PL) tone frequencies in Hz:
 210.7  218.1  225.7  233.6  241.8  250.3
 ```
 
-Set encode and decode to the same frequency for a standard PL repeater:
-
-```
-set ctcss encode freq 100.0
-set ctcss decode freq 100.0
-```
-
 ---
 
 ## Appendix C: Troubleshooting
 
-### "No module named 'sounddevice'"
-
-Install the audio library:
+### `/dev/hidraw*` missing or permission denied
 
 ```bash
-pip install sounddevice
+# Device should appear (vendor 0d8c)
+lsusb | grep 0d8c
+
+# hidraw node should be group-writable by audio
+ls -la /dev/hidraw*   # expected: crw-rw---- 1 root audio ...
 ```
 
-On Linux you may also need PortAudio:
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `/dev/hidraw*` missing | CM119 not plugged in | Check `dmesg \| tail` |
+| `crw-------` (root only) | udev rule not applied | Replug device after installing rule |
+| Open fails despite correct permissions | Group not active in session | Run `newgrp audio` or open new terminal |
 
-```bash
-sudo apt install libportaudio2
+### Audio device not found
+
+Set `audio_device` in `[hardware]` to the exact sounddevice name. For CM119:
+
+```toml
+audio_device = "USB PnP Sound Device"
 ```
 
-### "RPi.GPIO is not available"
+Leave empty for system default (may pick the wrong device on multi-card systems).
 
-You're running on a non-Pi machine. Use mock mode:
+### No audio passthrough / repeater doesn't repeat
 
-```bash
-# In the shell:
-set mock on
+- Check COR polarity: if `cor_active_low = true` but your hardware drives the
+  bit high on carrier detect, flip to `false`
+- Run with `log_level = "DEBUG"` and watch for "COR up/down" messages in the log
 
-# Or in the TOML file:
-# [hardware]
-# mock = true
-```
+### Courtesy tone not playing
 
-### CTCSS not detecting
+- Verify `ct_message` is set to an existing message name
+- Verify `ct_delay` is non-zero (the CT fires `ct_delay` seconds after COR drops)
+- Use `play <message>` in the shell to test the message directly
 
-- Verify the frequency matches your radio's PL tone exactly
-- Try lowering `decode_threshold` (e.g. from 0.015 to 0.010)
-- Increase `decode_time_ms` for more reliable detection (at the cost of
-  latency)
-- Check that audio input levels are adequate
+### ID not firing
 
-### CTCSS arriving before COS (tight squelch)
-
-This is normal and fully supported. In `cos_ctcss` and `ctcss_init`
-modes, the controller handles either signal arriving first. If you see
-"CTCSS first -- waiting for COS" in the log, the system is working
-correctly. If the COS doesn't arrive within `decode_time_ms`, the
-controller returns to IDLE. Consider increasing `decode_time_ms` if
-this happens frequently with a tight squelch.
-
-### Courtesy tone (CT) not playing
-
-- Verify the message exists: `msg show hang_ct`
-- Check the CT assignment: `msg list` or `telemetry list`
-- Verify the hang timer is non-zero: the CT plays after
-  `hang` milliseconds following COS drop
-
-### ID not firing in simulation
-
-- Check that messages exist: `msg list`
-- Verify messages are assigned to a rotation: `assign <name> mandatory`
-- Use `advance` to move the clock forward: `advance 601`
+- Check that `initial_ids` / `mandatory_ids` contain at least one message name
+- Verify the named messages exist: `msg list`
+- Check `id_interval` (default 600 s — wait 10 minutes or reduce it for testing)
 
 ### Voice clip not found
 
-- Use `show vocabulary` to see available clips
-- Verify the clip name matches a `.wav` filename (case-insensitive)
-- Check both `vocab_pcm/` and `user_pcm/` directories
-- Ensure `.wav` files are 16-bit mono format
+- Clip names are case-insensitive; reference them in uppercase in your messages
+- Check both `vocab_pcm/` and `user_pcm/` directories for the file
+- Custom clips must be mono WAV format
 
 ### Audio clipping or distortion
 
-The audio engine clips output to +/- 1.0 to prevent DAC overload. If
-you hear distortion:
-
 - Lower `repeat_gain` if RX passthrough is too hot
-- Lower `encode_level` for CTCSS (default 0.15 = 15% of peak)
-- Lower `morse_volume` or `voice_volume`
-- Check that input audio isn't already clipped (look for ADC clipping
-  warnings in the log)
+- Lower `morse_level` or `voice_level`
+- Check for ADC clipping warnings in the log (rate-limited to once per 5 s)
 
 ### Repeat audio too quiet / too loud
 
-Adjust the repeat gain:
-
 ```
-set repeat gain 1.5     Boost 50%
-set repeat gain 0.8     Reduce 20%
+set repeat gain 1.5     Boost RX audio 50% before re-transmission
+set repeat gain 0.8     Reduce RX audio 20%
 set repeat gain 1.0     Unity (default)
 ```
-
-The ADC clipping detector warns if input peaks exceed 0.98 FS. If you
-see these warnings, reduce the hardware input level or lower
-`repeat_gain`.

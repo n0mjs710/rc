@@ -35,11 +35,15 @@ class AudioConfig:
     rx_deemphasis:       bool  = True    # FM de-emphasis on RX audio
     tx_preemphasis:      bool  = False   # FM pre-emphasis on TX mix
     repeat_gain:         float = 1.0    # RX passthrough gain multiplier
-    morse_wpm:           int   = 20
-    morse_pitch:         int   = 700
-    morse_level:         float = 0.9
-    voice_level:         float = 0.9
-    voice_blocks_repeat: bool  = False   # mute RX passthrough during VOICE clips
+    morse_wpm:            int   = 20
+    morse_pitch:          int   = 700
+    morse_level:          float = 0.9
+    impolite_morse_level: float = 0.3    # CW level when IDing over an active QSO
+    voice_level:          float = 0.9
+    voice_blocks_repeat:  bool  = False  # mute RX passthrough during VOICE clips
+    pre_message_ms:       int   = 0      # dead air after PTT-on, before first CW/voice sample
+    post_message_ms:      int   = 0      # dead air after last sample drains, before PTT-off
+    ste_delay_ms:         int   = 0      # squelch tail elimination delay (0 = disabled)
 
 
 @dataclass
@@ -54,15 +58,16 @@ class TimerConfig:
     kerchunk:    float = 0.5    # s — minimum COR hold to respond
     timeout:     float = 180.0  # s — TOT transmit cutoff
     id_interval: float = 600.0  # s — mandatory ID interval (FCC ≤ 10 min)
-    id_pending:  float = 30.0   # s — queue pending ID this far before deadline
+    id_pending:  float = 60.0   # s — sneak pending ID this far before deadline
 
 
 @dataclass
 class IdentityConfig:
     startup_message:        str  = ""
     initial_ids:            list = field(default_factory=list)
-    pending_ids:            list = field(default_factory=list)
     mandatory_ids:          list = field(default_factory=list)
+    pending_id:             str  = ""   # single message; snuck in before mandatory deadline
+    impolite_id:            str  = ""   # single message; played over active QSO if deadline hit
     ct_message:             str  = ""
     timeout_message:        str  = ""
     timeout_cancel_message: str  = ""
@@ -207,8 +212,12 @@ class RepeaterConfig:
             f"  TX pre-emphasis: {'on' if a.tx_preemphasis else 'off'}",
             f"  Repeat gain    : {a.repeat_gain:.2f}x",
             f"  Morse          : {a.morse_wpm} WPM  {a.morse_pitch} Hz  {a.morse_level*100:.0f}%",
+            f"  Impolite level : {a.impolite_morse_level*100:.0f}% (CW over active QSO)",
             f"  Voice level    : {a.voice_level*100:.0f}%",
             f"  Voice blocks   : {'yes' if a.voice_blocks_repeat else 'no'}",
+            f"  Pre-msg pad    : {a.pre_message_ms} ms",
+            f"  Post-msg pad   : {a.post_message_ms} ms",
+            f"  STE delay      : {a.ste_delay_ms} ms{'' if a.ste_delay_ms else ' (disabled)'}",
             "",
             "── CTCSS ────────────────────────────────────",
             f"  Access mode    : {c.ctcss.access_mode}",
@@ -223,8 +232,9 @@ class RepeaterConfig:
             "",
             "── Identity ─────────────────────────────────",
             f"  Initial IDs    : {', '.join(c.identity.initial_ids) or '(none)'}",
-            f"  Pending IDs    : {', '.join(c.identity.pending_ids) or '(none)'}",
             f"  Mandatory IDs  : {', '.join(c.identity.mandatory_ids) or '(none)'}",
+            f"  Pending ID     : {c.identity.pending_id or '(none)'}",
+            f"  Impolite ID    : {c.identity.impolite_id or '(none)'}",
             f"  Startup msg    : {c.identity.startup_message or '(none)'}",
             f"  CT message     : {c.identity.ct_message or '(none)'}",
             f"  Timeout msg    : {c.identity.timeout_message or '(none)'}",
@@ -348,9 +358,13 @@ _ALIASES: list[tuple[set[str], str, str]] = [
     ({"morse", "speed", "wpm", "cw"},                     "audio",    "morse_wpm"),
     ({"morse", "pitch", "frequency", "freq", "cw"},       "audio",    "morse_pitch"),
     ({"morse", "level", "volume", "cw"},                  "audio",    "morse_level"),
+    ({"impolite", "level", "duck"},                       "audio",    "impolite_morse_level"),
     ({"voice", "level", "volume"},                        "audio",    "voice_level"),
     ({"repeat", "gain", "rx", "passthrough"},             "audio",    "repeat_gain"),
     ({"voice", "blocks", "repeat", "mute"},               "audio",    "voice_blocks_repeat"),
+    ({"pre", "message", "padding", "pad"},                "audio",    "pre_message_ms"),
+    ({"post", "message", "padding", "pad"},               "audio",    "post_message_ms"),
+    ({"ste", "squelch", "tail", "elimination"},           "audio",    "ste_delay_ms"),
     ({"rx", "hpf", "highpass"},                           "audio",    "rx_hpf"),
     ({"rx", "deemphasis", "de"},                          "audio",    "rx_deemphasis"),
     ({"tx", "preemphasis", "pre"},                        "audio",    "tx_preemphasis"),
@@ -368,7 +382,9 @@ _FIELD_TYPES: dict[str, str] = {
     "hang": "time_ms", "ct_delay": "time_ms", "kerchunk": "time_ms",
     "timeout": "time", "id_interval": "time", "id_pending": "time",
     "morse_wpm": "int", "morse_pitch": "int",
-    "morse_level": "float", "voice_level": "float", "repeat_gain": "float",
+    "morse_level": "float", "impolite_morse_level": "float",
+    "pre_message_ms": "int", "post_message_ms": "int", "ste_delay_ms": "int",
+    "voice_level": "float", "repeat_gain": "float",
     "voice_blocks_repeat": "bool", "rx_hpf": "bool",
     "rx_deemphasis": "bool", "tx_preemphasis": "bool",
     "access_mode": "str",

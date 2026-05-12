@@ -81,17 +81,21 @@ class Port:
         self._tot_start: float = 0.0   # loop.time() when current ACTIVE began
 
         # ID rotation index per type
-        self._id_rot: dict[str, int] = {"initial": 0, "pending": 0, "mandatory": 0}
-        self._last_id_time:   float = 0.0
-        self._initial_id_sent: bool = False
+        self._id_rot: dict[str, int] = {"initial": 0, "mandatory": 0}
+        self._last_id_time:       float = 0.0
+        self._tx_activity:        bool  = False  # TX occurred since last ID
+        self._initial_id_pending: bool  = False  # initial ID queued for end of hang
+        self._pending_id_armed:   bool  = False  # pending-ID window is open
+        self._voice_id_active:    bool  = False  # voice-element ID currently playing
+        self._id_epoch:           int   = 0      # incremented to signal interrupted coroutines
 
         # Timer handles
-        self._hang_timer:       asyncio.TimerHandle | None = None   # PTT holdoff (hangup)
-        self._ct_delay_timer:   asyncio.TimerHandle | None = None   # pre-CT delay
-        self._timeout_timer:    asyncio.TimerHandle | None = None
-        self._ctcss_timer:      asyncio.TimerHandle | None = None
-        self._id_timer:         asyncio.TimerHandle | None = None
-        self._pending_id_timer: asyncio.TimerHandle | None = None
+        self._hang_timer:     asyncio.TimerHandle | None = None   # PTT holdoff (hangup)
+        self._ct_delay_timer: asyncio.TimerHandle | None = None   # pre-CT delay
+        self._timeout_timer:  asyncio.TimerHandle | None = None
+        self._ctcss_timer:    asyncio.TimerHandle | None = None
+        self._id_timer:       asyncio.TimerHandle | None = None
+        self._id_sub_timer:   asyncio.TimerHandle | None = None   # pending-ID window opener
 
         # State-change subscribers (for API push events)
         self._state_listeners: list[Callable] = []
@@ -102,9 +106,9 @@ class Port:
         self._loop = loop
         self._hw.add_cor_callback(self._on_cor_edge)
         self._hw.add_ctcss_callback(self._on_ctcss_edge)
-        # _last_id_time stays 0.0 so first key always triggers an initial ID
-        self._schedule_id()
-        self._schedule_pending_id()
+        # Boot in quiet period — no ID timer until after the first initial ID fires.
+        # The initial ID fires at end of hang: startup hang if there is a startup
+        # message, otherwise the first user transmission's hang.
         if self.cfg.identity.startup_message:
             loop.create_task(self._play_startup())
         log.info("Port started — state=IDLE  access=%s", self.cfg.ctcss.access_mode)
@@ -112,7 +116,7 @@ class Port:
     def stop(self) -> None:
         self._hw.remove_cor_callback(self._on_cor_edge)
         self._hw.remove_ctcss_callback(self._on_ctcss_edge)
-        for name in ("hang", "ct_delay", "timeout", "ctcss", "id", "pending_id"):
+        for name in ("hang", "ct_delay", "timeout", "ctcss", "id", "id_sub"):
             self._cancel(name)
         self._set_ptt(False)
         log.info("Port stopped.")
@@ -181,11 +185,19 @@ class Port:
                          duration, self.cfg.timers.kerchunk)
                 self._cancel("timeout")
                 self._tot_used = 0.0
+                # Don't reward the kerchunker with a fast initial ID — cancel it
+                # and let the full interval run before we ID.
+                self._initial_id_pending = False
+                if self._id_timer is None:
+                    self._schedule_id()
                 self._set_ptt(False)
                 self._transition(State.IDLE)
             else:
                 self._transition(State.TAIL)
-                self._schedule_ct_delay()
+                if self._pending_id_armed:
+                    self._loop.create_task(self._do_pending_id())
+                else:
+                    self._schedule_ct_delay()
 
         elif self.state == State.TIMEOUT:
             # Offending transmission ended; TX comes back up for cancel msg + hang,
@@ -236,7 +248,10 @@ class Port:
         if am == "cor_ctcss" and self.state == State.ACTIVE:
             log.info("CTCSS idle in cor_ctcss mode → tail")
             self._transition(State.TAIL)
-            self._schedule_ct_delay()
+            if self._pending_id_armed:
+                self._loop.create_task(self._do_pending_id())
+            else:
+                self._schedule_ct_delay()
         elif self.state == State.PENDING:
             self._cancel("ctcss")
             self._transition(State.IDLE)
@@ -257,16 +272,17 @@ class Port:
             0.5, self._on_ctcss_timeout)   # 500 ms window to receive second signal
 
     def _schedule_id(self) -> None:
-        self._id_timer = self._loop.call_later(
-            self.cfg.timers.id_interval, self._on_id)
-
-    def _schedule_pending_id(self) -> None:
-        self._cancel("pending_id")
-        remaining = self.cfg.timers.id_interval - (self._loop.time() - self._last_id_time)
-        lead  = self.cfg.timers.id_pending
-        delay = max(0.0, remaining - lead)
-        if delay > 0:
-            self._pending_id_timer = self._loop.call_later(delay, self._on_pending_id)
+        self._cancel("id")
+        self._cancel("id_sub")
+        self._pending_id_armed = False
+        self._voice_id_active  = False
+        self._id_timer = self._loop.call_later(self.cfg.timers.id_interval, self._on_id)
+        lead = self.cfg.timers.id_pending
+        # Only arm the sub-timer if a pending_id message is actually configured,
+        # and the window is narrower than the full interval.
+        if self.cfg.identity.pending_id and 0 < lead < self.cfg.timers.id_interval:
+            self._id_sub_timer = self._loop.call_later(
+                self.cfg.timers.id_interval - lead, self._on_id_sub)
 
     def _cancel(self, name: str) -> None:
         attr = f"_{name}_timer"
@@ -295,6 +311,10 @@ class Port:
         self._hang_timer = None
         if self._cor:
             return   # COR went active during hang; state machine will handle it
+        if self._initial_id_pending:
+            self._initial_id_pending = False
+            self._loop.create_task(self._do_initial_id())
+            return   # PTT stays on; _do_initial_id drops it and transitions to IDLE
         self._set_ptt(False)
         self._transition(State.IDLE)
 
@@ -316,23 +336,34 @@ class Port:
             log.warning("PENDING timeout — %s not received — back to IDLE", missing)
             self._transition(State.IDLE)
 
-    def _on_pending_id(self) -> None:
-        self._pending_id_timer = None
-        log.info("Pending ID timer fired")
-        self._loop.create_task(self._transmit_id("pending"))
+    def _on_id_sub(self) -> None:
+        self._id_sub_timer = None
+        log.debug("Pending ID window open — will ID at next COR drop")
+        self._pending_id_armed = True
 
     def _on_id(self) -> None:
         self._id_timer = None
-        log.info("Mandatory ID timer fired")
-        self._cancel("pending_id")
-        self._loop.create_task(self._do_mandatory_id())
+        self._cancel("id_sub")
+        self._pending_id_armed = False
+        # Mid-transmission always counts as activity — the user is on right now.
+        if self.state == State.ACTIVE:
+            self._tx_activity = True
+        if not self._tx_activity:
+            log.info("ID interval expired — no TX activity, entering quiet period")
+            return
+        if self.state == State.ACTIVE:
+            log.warning("ID required over active QSO — transmitting impolite ID")
+            self._loop.create_task(self._do_impolite_id())
+        else:
+            log.info("Mandatory ID timer fired")
+            self._loop.create_task(self._do_mandatory_id())
 
     # ── async audio helpers ────────────────────────────────────────────────────
 
     async def _drain_clips(self) -> None:
         """Yield to the event loop until the audio engine's clip queue is empty."""
         while self._engine.is_playing():
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
 
     async def _do_timeout_announce(self) -> None:
         """Play the timeout message (PTT already on), then drop PTT."""
@@ -345,6 +376,7 @@ class Port:
 
     async def _do_timeout_recovery(self) -> None:
         """After timeout clears: play cancel message (if configured), then hang."""
+        self._note_tx_start()
         name = self.cfg.identity.timeout_cancel_message
         if name:
             self._play_message(name)
@@ -353,29 +385,105 @@ class Port:
             self._schedule_hang()
 
     async def _do_mandatory_id(self) -> None:
-        """Transmit mandatory ID, then reschedule the ID timer."""
+        """Transmit mandatory ID, reset activity flag, restart the ID timer."""
+        epoch = self._id_epoch
         await self._transmit_id("mandatory")
+        if self._id_epoch != epoch:
+            return
         self._last_id_time = self._loop.time()
+        self._tx_activity = False
         self._schedule_id()
-        self._schedule_pending_id()
+
+    async def _do_impolite_id(self) -> None:
+        """ID over the top of an active QSO with a reduced CW level.
+
+        Falls back to mandatory ID if impolite_id is not configured.
+        CW level is temporarily swapped before rendering (render is synchronous
+        so the swap is safe in the single-threaded asyncio context).
+        """
+        name = self.cfg.identity.impolite_id
+        if not name:
+            await self._do_mandatory_id()
+            return
+        saved = self.cfg.audio.morse_level
+        self.cfg.audio.morse_level = self.cfg.audio.impolite_morse_level
+        self._play_message(name)
+        self.cfg.audio.morse_level = saved
+        self._last_id_time = self._loop.time()
+        # Leave _tx_activity True: the QSO is still active, and the ongoing
+        # transmission counts as activity in the new ID interval.
+        self._schedule_id()
+
+    async def _do_pending_id(self) -> None:
+        """Play pending ID at the start of tail (before CT delay), reset ID cycle.
+
+        Called from _cor_idle() / _ctcss_idle() when _pending_id_armed and COR
+        drops cleanly.  Plays the message, drains, resets the ID cycle as if a
+        mandatory ID had just fired, then hands off to the normal CT delay.
+        """
+        epoch = self._id_epoch
+        name = self.cfg.identity.pending_id
+        if name:
+            self._voice_id_active = self._message_has_voice(name)
+            self._play_message(name)
+            await self._drain_clips()
+            self._voice_id_active = False
+        if self._id_epoch != epoch:
+            return
+        self._last_id_time = self._loop.time()
+        self._tx_activity = False
+        self._schedule_id()
+        if self.state == State.TAIL and not self._cor:
+            self._schedule_ct_delay()
+
+    async def _do_initial_id(self) -> None:
+        """Play initial ID at end of hang, start ID timer, then go IDLE.
+
+        Called from _on_hang() when _initial_id_pending was set.  PTT is
+        already on; we play the ID, wait for audio to drain, then drop PTT
+        and transition to IDLE.  If COR goes active during the drain the
+        state machine takes over (state becomes ACTIVE) and we leave PTT alone.
+        """
+        epoch = self._id_epoch
+        await self._transmit_id("initial")   # PTT on; just queues audio
+        await self._drain_clips()
+        self._voice_id_active = False
+        if self._id_epoch != epoch:
+            return
+        self._last_id_time = self._loop.time()
+        if not self._id_timer:
+            self._schedule_id()
+        if self.state != State.ACTIVE:
+            self._tx_activity = False
+            if not self._cor:
+                self._set_ptt(False)
+                self._transition(State.IDLE)
 
     async def _play_startup(self) -> None:
-        """Key TX at boot and play the configured startup message."""
+        """Key TX at boot and play the startup message.
+
+        The initial ID fires naturally at end of the hang that follows,
+        via the same _on_hang() → _do_initial_id() path as any first
+        user transmission from quiet period.  No CT is played — CTs are
+        user-facing signals that aren't meaningful for system transmissions.
+        """
         msg = self.cfg.identity.startup_message
         if msg not in self.cfg.messages:
             log.warning("Startup message '%s' not found in config", msg)
             return
         log.info("Startup message → '%s'", msg)
+        self._note_tx_start()
         self._set_ptt(True)
+        pre_s = self.cfg.audio.pre_message_ms / 1000.0
+        if pre_s > 0 and self._message_needs_padding(msg):
+            await asyncio.sleep(pre_s)
         self._play_message(msg)
         await self._drain_clips()
-        self._set_ptt(False)
+        self._schedule_hang()
 
     async def _transmit_id(self, id_type: str) -> None:
         if id_type == "initial":
             rotation = list(self.cfg.identity.initial_ids)
-        elif id_type == "pending":
-            rotation = list(self.cfg.identity.pending_ids)
         else:
             rotation = list(self.cfg.identity.mandatory_ids)
 
@@ -388,16 +496,26 @@ class Port:
         self._id_rot[id_type] = (idx + 1) % len(rotation)
         log.info("ID (%s) → '%s'", id_type, msg_name)
 
+        self._voice_id_active = self._message_has_voice(msg_name)
+
         state_before = self.state
         was_ptt = self._engine._ptt
+        needs_pad = not was_ptt and self._message_needs_padding(msg_name)
+        pre_s     = self.cfg.audio.pre_message_ms  / 1000.0
+        post_s    = self.cfg.audio.post_message_ms / 1000.0
         if not was_ptt:
             self._set_ptt(True)
+            if needs_pad and pre_s > 0:
+                await asyncio.sleep(pre_s)
         self._play_message(msg_name)
         if not was_ptt:
             # PTT was off when we started; wait for audio to finish before
             # dropping it.  If the state machine took over PTT during the
             # await (e.g., COR went active, state changed), leave PTT alone.
             await self._drain_clips()
+            self._voice_id_active = False
+            if needs_pad and post_s > 0:
+                await asyncio.sleep(post_s)
             if self.state == state_before:
                 self._set_ptt(False)
 
@@ -463,6 +581,25 @@ class Port:
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
+    def _message_has_voice(self, name: str) -> bool:
+        return any(e.get("type") == "voice"
+                   for e in self.cfg.messages.get(name, []))
+
+    def _message_needs_padding(self, name: str) -> bool:
+        return any(e.get("type") in ("cw", "voice")
+                   for e in self.cfg.messages.get(name, []))
+
+    def _note_tx_start(self) -> None:
+        """Record that the transmitter is going active for a non-ID reason.
+
+        Call this from any code that brings PTT up outside the COR state
+        machine (startup, timeout recovery, etc.).  Sets tx_activity and,
+        in quiet period, queues the initial ID for the end of the next hang.
+        """
+        self._tx_activity = True
+        if self._id_timer is None:
+            self._initial_id_pending = True
+
     def _set_ptt(self, active: bool) -> None:
         self._hw.set_ptt(active)
         self._engine.set_ptt(active)
@@ -517,20 +654,26 @@ class Port:
         elif new_state == State.TIMEOUT:
             self._tot_used = 0.0   # clean slate for post-timeout recovery
 
-        # Initial ID on first activation after a long idle period
-        if new_state == State.ACTIVE and old in (State.IDLE, State.PENDING):
-            elapsed = self._loop.time() - self._last_id_time
-            if elapsed >= self.cfg.timers.id_interval and not self._initial_id_sent:
-                self._initial_id_sent = True
-                log.info("Initial ID (idle %.0fs)", elapsed)
-                self._loop.create_task(self._transmit_id("initial"))
-                self._last_id_time = self._loop.time()
-                self._cancel("id")
-                self._schedule_id()
-                self._schedule_pending_id()
-
-        if new_state == State.IDLE:
-            self._initial_id_sent = False
+        # TX activity tracking and initial-ID queuing on ACTIVE transitions.
+        if new_state == State.ACTIVE:
+            self._tx_activity = True
+            if old in (State.IDLE, State.PENDING) and self._id_timer is None:
+                # First TX from quiet period — queue initial ID for end of hang.
+                self._initial_id_pending = True
+            elif old == State.TAIL and self._initial_id_pending:
+                # COR came back during hang before the initial ID fired — cancel
+                # it and start the mandatory-ID timer instead (two transmissions
+                # without an ID, so the clock needs to run).
+                self._initial_id_pending = False
+                if self._id_timer is None:
+                    self._schedule_id()
+            # If a voice-element ID is currently playing, interrupt it.
+            # CW/tone IDs are readable over voice, so only voice IDs are cancelled.
+            if self._voice_id_active and self._engine.is_playing():
+                self._id_epoch += 1
+                self._voice_id_active = False
+                self._engine.clear_clips()
+                self._loop.create_task(self._do_impolite_id())
 
         self._notify_listeners()
 

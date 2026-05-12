@@ -20,6 +20,7 @@ simple attribute reads; _clip_lock guards the clip deque.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 import wave
@@ -163,6 +164,7 @@ class AudioEngine:
                  tx_preemphasis:      bool       = False,
                  repeat_gain:         float      = 1.0,
                  voice_blocks_repeat: bool       = False,
+                 ste_delay_ms:        int        = 0,
                  ) -> None:
 
         self.sample_rate        = sample_rate
@@ -195,6 +197,19 @@ class AudioEngine:
         # Clip queue (left channel / main TX mix)
         self._clips:    deque[Clip] = deque()
         self._clip_lock             = threading.Lock()
+
+        # STE (squelch tail elimination) delay buffer.
+        # A FIFO of callback-sized blocks accumulates filtered RX audio while
+        # the passthrough gate is open.  Reading lags writing by _ste_delay_blocks
+        # blocks, so gate closure discards the noisy tail before it exits the queue.
+        # _ste_flush is set by the asyncio thread (GIL-safe bool); the callback
+        # clears the queue on the next fire — no locking needed for the deque.
+        self._ste_delay_blocks: int = (
+            math.ceil(ste_delay_ms * sample_rate / 1000 / blocksize)
+            if ste_delay_ms > 0 else 0
+        )
+        self._ste_queue: deque[np.ndarray] = deque()
+        self._ste_flush: bool = False
 
         # ADC clipping rate limiter
         self._last_clip_warn: float = 0.0
@@ -241,8 +256,14 @@ class AudioEngine:
         so received audio is re-transmitted.  Set False the moment the signal
         drops so FM squelch noise from an ungated discriminator does not reach
         the TX during CT delay, CT playback, or hang.  Queued clips continue.
+
+        When STE is enabled, opening the gate signals the callback to flush the
+        delay queue so stale audio from the previous transmission does not replay.
         """
+        prev = self._passthrough
         self._passthrough = active
+        if active and not prev and self._ste_delay_blocks > 0:
+            self._ste_flush = True
 
     def play_clip(self, clip: Clip, priority: bool = False) -> None:
         """Queue a clip for TX playback.  priority=True plays it next."""
@@ -318,6 +339,24 @@ class AudioEngine:
             rx = self._rx_hpf.process(rx)
         if self._rx_deemph is not None:
             rx = self._rx_deemph.process(rx)
+
+        # STE delay: runs entirely in the callback thread.  _ste_flush is set
+        # by the asyncio thread (GIL-safe bool) and consumed here.  While the
+        # passthrough is open, each block is appended to the queue; once the
+        # queue holds more than _ste_delay_blocks blocks the oldest block is
+        # dequeued as the passthrough source.  When the gate closes the queue
+        # is abandoned — the noise crash that entered the ADC after the unkey
+        # is in the queue but never exits it.
+        if self._ste_delay_blocks > 0:
+            if self._ste_flush:
+                self._ste_queue.clear()
+                self._ste_flush = False
+            if self._passthrough:
+                self._ste_queue.append(rx.copy())
+                if len(self._ste_queue) > self._ste_delay_blocks:
+                    rx = self._ste_queue.popleft()
+                else:
+                    rx = np.zeros(frames, dtype=np.float32)
 
         # Build left-channel TX mix — passthrough only while qualifying signal
         # is present.  _passthrough is False once the signal drops, keeping

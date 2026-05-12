@@ -15,28 +15,33 @@ rx_hpf              = true    # 300 Hz high-pass on RX (removes CTCSS/hum)
 rx_deemphasis       = true    # FM de-emphasis on RX audio
 tx_preemphasis      = false   # FM pre-emphasis on TX mix
 repeat_gain         = 1.0     # RX passthrough gain (1.0 = unity)
-morse_wpm           = 20
-morse_pitch         = 700
-morse_level         = 0.5
-voice_level         = 1.0
-voice_blocks_repeat = false   # mute RX passthrough while VOICE clips play
+morse_wpm             = 20
+morse_pitch           = 700
+morse_level           = 0.5
+impolite_morse_level  = 0.3   # CW level when IDing over an active QSO
+voice_level           = 1.0
+voice_blocks_repeat   = false  # mute RX passthrough while VOICE clips play
+pre_message_ms        = 0      # ms dead air after PTT-on before CW/voice starts
+post_message_ms       = 0      # ms dead air after audio drains before PTT-off
+ste_delay_ms          = 0      # squelch tail elimination delay 0=disabled, max ~500
 
 [ctcss]
 access_mode = "cor"   # "cor" (COR alone) or "cor_ctcss" (both required)
 
 [timers]
-hang        = 2.5     # s — hang time: PTT holdoff after CT (how long before TX "hangs up")
+hang        = 5.0     # s — hang time: PTT holdoff after CT (how long before TX "hangs up")
 ct_delay    = 0.5     # s — delay from RX stream loss to courtesy tone
-kerchunk    = 0.5     # s — minimum COR hold to respond (anti-kerchunk)
-timeout     = 180.0   # s — time-out timer (TOT) transmit cutoff
-id_interval = 600.0   # s — mandatory ID interval (FCC ≤ 10 min)
-id_pending  = 60.0    # s — queue pending ID this far before deadline
+kerchunk    = 0.0     # s — minimum COR hold to respond (anti-kerchunk)
+timeout     = 18.0    # s — time-out timer (TOT) transmit cutoff
+id_interval = 60.0    # s — mandatory ID interval (FCC ≤ 10 min)
+id_pending  = 20.0    # s — sneak pending ID this far before deadline
 
 [identity]
 startup_message = "rc08_startup"
 initial_ids   = ["default_voice"]
-pending_ids   = ["default_voice"]
 mandatory_ids = ["default_cw"]
+pending_id    = ""    # single message; snuck in at COR drop before mandatory deadline
+impolite_id   = ""    # single message; played over active QSO if deadline is hit
 ct_message    = "yellow_jacket"
 timeout_message = "timeout_warn"
 

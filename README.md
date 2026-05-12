@@ -31,13 +31,15 @@ Signal mapping (AllStar `chan_usbradio` convention):
 
 | Signal | Direction | HID / Audio path |
 |--------|-----------|-----------------|
-| COR    | Input     | HID Vol-Down bit (byte 0, bit 0) |
-| CTCSS  | Input     | HID Vol-Up bit (byte 0, bit 1) |
+| COR    | Input     | HID Vol-Up bit (byte 0, bit 1, 0x02) |
+| CTCSS  | Input     | HID Vol-Down bit (byte 0, bit 0, 0x01) |
 | PTT    | Output    | HID GPIO3 bit (output report, bit 2) |
 | RX audio | Input  | USB audio mic channel (discriminator output) |
 | TX audio | Output | USB audio left speaker channel |
 
 The right audio output channel is reserved for a future CTCSS encode tone.
+
+> **Board-specific:** The COR/CTCSS bit assignments above match the Masters Communications CM119 board. Some boards (e.g., DMK URIx) swap Vol-Up and Vol-Down. Adjust `cor_active_low` / `ctcss_active_low` in `[hardware]` to match your interface.
 
 ## Requirements
 
@@ -96,9 +98,9 @@ os.close(fd)
 
 ## Voice vocabulary
 
-Pre-rendered voice WAV files live in `vocab_pcm/` (committed to git — no generation step needed after cloning).
+712 pre-rendered voice clips live in `vocab_pcm/` (committed to git — no generation step needed after cloning). They are sourced from the original **Texas Instruments speech synthesizer library** used in the famous repeater controllers of the 1980s and 1990s — included here as a deliberate nod to the controllers many of us grew up hearing on the air.
 
-Drop custom `.wav` files in `user_pcm/` to override or extend the vocabulary. Files are loaded by name (case-insensitive, without extension).
+Drop custom `.wav` files in `user_pcm/` to override any built-in clip or add new ones. Files are loaded by name (case-insensitive, without extension). `user_pcm/` takes precedence over `vocab_pcm/` on name collisions — you can replace the entire built-in vocabulary with your own recordings if you prefer a different voice.
 
 ## Running
 
@@ -139,26 +141,42 @@ set ctcss access cor_ctcss
 
 ## Configuration
 
+**The shell is the primary configuration interface.** Connect to the running daemon with `python shell.py repeater.toml` and use `set` and `msg` commands to change settings and build messages live — no file editing required. Changes made with `set` take effect immediately on the running daemon. A `save` command (planned for the v1.0 release) will write the live configuration back to `repeater.toml`, making the shell the complete round-trip interface for all settings.
+
+For now, use the TOML file for initial site setup (hardware device names, callsign embedded in your first ID message, access mode) and for anything the shell doesn't yet cover (identity slot assignments such as `initial_ids`, `mandatory_ids`). Once the daemon is running, day-to-day tuning — timers, audio levels, courtesy tones, message content — is all done through the shell. Use `reload` to pull TOML changes into a running daemon without restarting.
+
+### TOML quick-start
+
 Copy the sample and edit for your site:
 
 ```bash
 cp repeater.toml.sample repeater.toml
 ```
 
-`repeater.toml` is gitignored — it holds your callsign, hardware device names, and access settings. `repeater.toml.sample` is the committed reference.
+`repeater.toml` is gitignored — it holds your callsign (embedded in your ID messages), hardware device names, and access settings. `repeater.toml.sample` is the committed reference.
 
 Key sections:
 
 ```toml
+[hardware]
+cor_active_low   = true   # true = bit clear means COR active (AllStar convention)
+ctcss_active_low = true   # true = bit clear means CTCSS active
+
 [ctcss]
 access_mode = "cor"       # "cor" = COR alone opens repeater
                           # "cor_ctcss" = both COR and CTCSS required
 
 [audio]
-rx_hpf          = true   # 300 Hz HPF removes sub-audible energy from RX
-rx_deemphasis   = true   # FM de-emphasis on received audio
-tx_preemphasis  = false  # FM pre-emphasis on transmitted audio
-repeat_gain     = 1.0    # RX passthrough level multiplier
+rx_hpf               = true   # 300 Hz HPF removes sub-audible energy from RX
+rx_deemphasis        = true   # FM de-emphasis on received audio
+tx_preemphasis       = false  # FM pre-emphasis on transmitted audio
+repeat_gain          = 1.0    # RX passthrough level multiplier
+morse_level          = 0.9    # CW amplitude
+impolite_morse_level = 0.3    # CW level when IDing over an active QSO (ducked)
+voice_level          = 0.9    # voice clip amplitude
+pre_message_ms       = 0      # dead air after PTT-on before CW/voice starts
+post_message_ms      = 0      # dead air after audio drains before PTT-off
+ste_delay_ms         = 0      # squelch tail elimination delay (0 = disabled)
 
 [timers]
 hang        = 2.5    # s — hang time: PTT holdoff after CT ("hangup time")
@@ -166,6 +184,17 @@ ct_delay    = 0.5    # s — delay from RX stream loss to courtesy tone
 kerchunk    = 0.5    # s — minimum COR hold to respond
 timeout     = 180.0  # s — TOT cutoff
 id_interval = 600.0  # s — FCC ID interval (≤ 10 min)
+id_pending  = 60.0   # s — arm pending ID this far before mandatory deadline
+
+[identity]
+startup_message        = ""              # message played at daemon start
+initial_ids            = ["default_voice"]   # rotation; played at end of first hang
+mandatory_ids          = ["default_cw"]      # rotation; played when ID interval expires
+pending_id             = ""              # sneaked in at COR drop before deadline
+impolite_id            = ""              # played over active QSO if deadline hits
+ct_message             = "yellow_jacket"
+timeout_message        = "timeout_warn"
+timeout_cancel_message = ""              # played when TX resumes after timeout
 ```
 
 Your site config lives in `repeater.toml` (gitignored). The committed `repeater.toml.sample` is the reference template.
@@ -187,32 +216,37 @@ elements = [
 Element types:
 - `cw` — Morse code rendered in-process
 - `voice` — pre-rendered WAV clip from `vocab_pcm/` or `user_pcm/`
-- `tone` — synthesized tone (supports dual-frequency for DTMF-style tones)
+- `tone` — synthesized tone (dual-frequency supported for DTMF-style tones)
 
-### Courtesy tones
+### Station identification
 
-```toml
-[courtesy_tones.my_tone]
-elements = [[1000, 0, 50, 0.8], [0, 0, 30, 0.0], [1200, 0, 50, 0.8]]
-# format: [freq1_hz, freq2_hz, duration_ms, amplitude]
-```
+The controller implements FCC Part 97 ID requirements automatically:
+
+- **Initial ID** — played at the end of the hang following the first transmission from a quiet period (polite: waits for the QSO to end)
+- **Mandatory ID** — played when the 10-minute interval expires and the TX has been active; fires between turns if the `id_pending` window is armed, or over an active QSO (`impolite_id`) if the deadline hits mid-transmission
+- **Quiet period** — if no TX has occurred since the last ID, the timer expires silently with no transmission
+
+### Squelch tail elimination
+
+`ste_delay_ms` introduces a software audio delay (0–500 ms) between the RX filter chain and the passthrough gate. The gate still operates on real-time hardware COR/CTCSS edges. When the gate closes, the delay buffer is discarded — the FM noise burst that occurs after the user unkeys exits the ADC into the delay buffer but never reaches the TX. Set to 25–150 ms depending on your hardware's COR decoder hysteresis.
 
 ## Running as a systemd service
 
-The service runs as your user (edit `User=` and paths in `systemd/rc.service` to match your username). The socket and all runtime files stay inside the project directory — nothing is scattered across the OS.
-
-Install and start:
+Install the service with the setup script — it substitutes your username and project path automatically:
 
 ```bash
-sudo cp systemd/rc.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable rc
+bash setup.sh --service
 sudo systemctl start rc
 
 # Check status
 sudo systemctl status rc
 journalctl -u rc -f
+
+# After editing code, restart to pick up changes
+sudo systemctl restart rc
 ```
+
+`systemd/rc.service` is a reference template with `<USER>` / `<PROJECT_DIR>` placeholders. Do not copy it directly — `setup.sh --service` generates the correctly substituted unit file.
 
 For manual use (outside systemd), the socket is at `run/rc.sock` inside the project directory — no root needed, nothing outside the project tree.
 

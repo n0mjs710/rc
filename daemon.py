@@ -93,6 +93,7 @@ class Daemon:
             tx_preemphasis      = ac.tx_preemphasis,
             repeat_gain         = ac.repeat_gain,
             voice_blocks_repeat = ac.voice_blocks_repeat,
+            ste_delay_ms        = ac.ste_delay_ms,
         )
         self._engine.start()
 
