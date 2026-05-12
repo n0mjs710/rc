@@ -670,6 +670,9 @@ class Port:
             # If a voice-element ID is currently playing, interrupt it.
             # CW/tone IDs are readable over voice, so only voice IDs are cancelled.
             if self._voice_id_active and self._engine.is_playing():
+                # The impolite ID takes over the ID cycle — cancel any pending
+                # initial ID flag so _on_hang() doesn't fire a second voice ID.
+                self._initial_id_pending = False
                 self._id_epoch += 1
                 self._voice_id_active = False
                 self._engine.clear_clips()
