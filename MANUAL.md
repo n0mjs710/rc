@@ -550,7 +550,7 @@ The CM119 only supports 44100 and 48000 Hz sample rates. The controller uses
 The `vocab_pcm/` directory contains 712 pre-rendered voice clips covering
 aviation, radio, and general vocabulary. These clips are sourced from the
 original **Texas Instruments speech synthesizer library** used in the famous
-repeater controllers of the 1980s and 1990s (most notably the NHRC and
+repeater controllers of the 1980s and 1990s (most notably ACC, FF Systems and
 similar controllers of that era) — included here as a deliberate nod to
 the controllers many of us grew up hearing on the air.
 
