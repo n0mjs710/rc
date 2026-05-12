@@ -87,6 +87,7 @@ class Port:
         self._initial_id_pending: bool  = False  # initial ID queued for end of hang
         self._pending_id_armed:   bool  = False  # pending-ID window is open
         self._voice_id_active:    bool  = False  # voice-element ID currently playing
+        self._impolite_id_playing: bool = False  # impolite ID in progress; suppresses CT queueing
         self._id_epoch:           int   = 0      # incremented to signal interrupted coroutines
 
         # Timer handles
@@ -196,7 +197,9 @@ class Port:
                 self._transition(State.TAIL)
                 if self._pending_id_armed:
                     self._loop.create_task(self._do_pending_id())
-                else:
+                elif not self._impolite_id_playing:
+                    # Suppress CT delay while impolite ID is playing; it will
+                    # fire one CT itself after the audio drains.
                     self._schedule_ct_delay()
 
         elif self.state == State.TIMEOUT:
@@ -250,7 +253,7 @@ class Port:
             self._transition(State.TAIL)
             if self._pending_id_armed:
                 self._loop.create_task(self._do_pending_id())
-            else:
+            elif not self._impolite_id_playing:
                 self._schedule_ct_delay()
         elif self.state == State.PENDING:
             self._cancel("ctcss")
@@ -395,24 +398,46 @@ class Port:
         self._schedule_id()
 
     async def _do_impolite_id(self) -> None:
-        """ID over the top of an active QSO with a reduced CW level.
+        """ID over an active QSO at reduced CW level; collapses all COR activity
+        that occurs during playback into a single CT at the end.
 
-        Falls back to mandatory ID if impolite_id is not configured.
-        CW level is temporarily swapped before rendering (render is synchronous
-        so the swap is safe in the single-threaded asyncio context).
+        Uses impolite_id if configured; falls back to the mandatory rotation.
+        Never sets _voice_id_active — impolite IDs are not themselves interruptible.
+        Suppresses per-COR-drop CT delays while playing (via _impolite_id_playing);
+        fires exactly one CT after the audio drains if COR has dropped by then.
         """
         name = self.cfg.identity.impolite_id
         if not name:
-            await self._do_mandatory_id()
-            return
+            rotation = list(self.cfg.identity.mandatory_ids)
+            if not rotation:
+                log.warning("No impolite or mandatory ID configured")
+                self._last_id_time = self._loop.time()
+                self._schedule_id()
+                return
+            idx  = self._id_rot.get("mandatory", 0) % len(rotation)
+            name = rotation[idx]
+            self._id_rot["mandatory"] = (idx + 1) % len(rotation)
+
+        log.info("Impolite ID → '%s'", name)
+        self._impolite_id_playing = True
         saved = self.cfg.audio.morse_level
         self.cfg.audio.morse_level = self.cfg.audio.impolite_morse_level
         self._play_message(name)
         self.cfg.audio.morse_level = saved
+        await self._drain_clips()
+        self._impolite_id_playing = False
+
         self._last_id_time = self._loop.time()
-        # Leave _tx_activity True: the QSO is still active, and the ongoing
-        # transmission counts as activity in the new ID interval.
+        # Leave _tx_activity True (QSO still active).
         self._schedule_id()
+
+        # If COR dropped while we were playing, state is TAIL — fire one CT now
+        # to acknowledge the QSO, regardless of how many COR cycles happened.
+        if self.state == State.TAIL and not self._cor:
+            ct = self.cfg.identity.ct_message
+            if ct:
+                self._play_message(ct)
+            self._schedule_hang()
 
     async def _do_pending_id(self) -> None:
         """Play pending ID at the start of tail (before CT delay), reset ID cycle.
