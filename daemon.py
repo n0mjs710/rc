@@ -113,6 +113,7 @@ class Daemon:
         self._api.register("msg_delete", self._cmd_msg_delete)
         self._api.register("msg_clear",  self._cmd_msg_clear)
         self._api.register("msg_add",    self._cmd_msg_add)
+        self._api.register("ports",      self._cmd_ports)
         await self._api.start()
 
         port_names = ", ".join(p.name for p in self._ports)
@@ -171,9 +172,16 @@ class Daemon:
 
     async def _cmd_state(self, msg: dict | None = None) -> dict:
         port = self._get_port(msg)
+        port_names = [p.name for p in self._ports]
         if not port:
-            return {"state": "NOT_RUNNING"}
-        return {"port": port.name, **port.get_status()}
+            return {"state": "NOT_RUNNING", "ports": port_names}
+        return {"port": port.name, "ports": port_names, **port.get_status()}
+
+    async def _cmd_ports(self, msg: dict) -> dict:
+        return {"ports": [
+            {"name": p.name, **p.get_status()}
+            for p in self._ports
+        ]}
 
     async def _cmd_config(self, msg: dict) -> dict:
         return {"result": self.cfg.describe()}

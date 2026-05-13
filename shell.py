@@ -12,7 +12,9 @@ Usage:
 
 Commands
 ────────
-  state               Show current repeater state
+  ports               List all ports and their current state
+  port <name>         Switch active port context
+  state               Show current port state
   config              Show full configuration
   set <args>          Change a config value (e.g. "set hang 2500")
   play <message>      Trigger a named message
@@ -56,7 +58,6 @@ import json
 import readline
 import socket
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -69,9 +70,11 @@ class DaemonConnection:
     """Synchronous Unix socket connection to the daemon."""
 
     def __init__(self, socket_path: str) -> None:
-        self._path = socket_path
+        self._path  = socket_path
         self._sock: socket.socket | None = None
-        self._buf  = b""
+        self._buf   = b""
+        self.current_port: str       = ""   # currently selected port name
+        self.known_ports:  list[str] = []   # all port names reported by daemon
 
     def connect(self) -> None:
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -106,7 +109,6 @@ class DaemonConnection:
         resp = self.recv_line()
         if resp is None:
             raise ConnectionError("Connection closed by daemon")
-        # Skip any push event lines to find the command response
         while resp.get("event"):
             resp = self.recv_line()
             if resp is None:
@@ -129,26 +131,33 @@ class DaemonConnection:
         finally:
             self._sock.settimeout(5.0)
 
+    def with_port(self, obj: dict) -> dict:
+        """Return obj with "port": current_port injected (if a port is selected)."""
+        if self.current_port:
+            return {**obj, "port": self.current_port}
+        return obj
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fmt_status(s: dict) -> str:
+    port   = s.get("port", "")
     state  = s.get("state", "?")
-    cor    = "COR" if s.get("cor") else "---"
+    cor    = "COR"   if s.get("cor")   else "---"
     ctcss  = "CTCSS" if s.get("ctcss") else "-----"
-    ptt    = "PTT" if s.get("ptt") else "---"
+    ptt    = "PTT"   if s.get("ptt")   else "---"
     access = s.get("access", "?")
-    return f"{state:<10}  {cor}  {ctcss}  {ptt}  (access={access})"
+    prefix = f"[{port}] " if port else ""
+    return f"{prefix}{state:<10}  {cor}  {ctcss}  {ptt}  (access={access})"
 
 
 def _print_response(resp: dict) -> None:
     if resp.get("ok") is False:
         print(f"Error: {resp.get('error', '?')}")
         return
-    # Remove housekeeping keys
-    body = {k: v for k, v in resp.items() if k not in ("ok",)}
+    body = {k: v for k, v in resp.items() if k not in ("ok", "ports")}
     if "state" in body:
         print(_fmt_status(body))
     elif "result" in body:
@@ -169,13 +178,21 @@ def _print_config(cfg: dict) -> None:
             for k, v in values.items():
                 print(f"  {k:<22} = {v}")
 
-    # Messages
     msgs = cfg.get("messages", {})
     if msgs:
         print("\n[messages]")
         for name, elems in sorted(msgs.items()):
             types = ", ".join(e.get("type", "?") for e in elems if isinstance(e, dict))
             print(f"  {name:<20}  [{types}]")
+
+
+def _print_ports(resp: dict) -> None:
+    ports = resp.get("ports", [])
+    if not ports:
+        print("  (no ports)")
+        return
+    for p in ports:
+        print(" ", _fmt_status(p))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,7 +206,7 @@ def watch_mode(conn: DaemonConnection) -> None:
         return
 
     print("Watching events (Ctrl-C to stop)…\n")
-    conn._sock.settimeout(None)   # blocking
+    conn._sock.settimeout(None)
     try:
         while True:
             msg = conn.recv_line()
@@ -211,8 +228,8 @@ def watch_mode(conn: DaemonConnection) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 COMMANDS = [
-    "state", "config", "set", "play", "ptt", "reload", "shutdown",
-    "subscribe", "watch", "msg", "help", "quit", "exit",
+    "ports", "port", "state", "config", "set", "play", "ptt",
+    "reload", "shutdown", "subscribe", "watch", "msg", "help", "quit", "exit",
 ]
 
 def _completer(text: str, state: int):
@@ -229,7 +246,7 @@ def _cmd_msg(conn: DaemonConnection, rest: str) -> None:
     sub = parts[0].lower()
 
     if sub == "list":
-        resp = conn.command({"cmd": "msg_list"})
+        resp = conn.command(conn.with_port({"cmd": "msg_list"}))
         if resp.get("ok") is False:
             print(f"Error: {resp.get('error', '?')}")
             return
@@ -244,7 +261,7 @@ def _cmd_msg(conn: DaemonConnection, rest: str) -> None:
         if len(parts) < 2:
             print("Usage: msg show <name>")
             return
-        resp = conn.command({"cmd": "msg_show", "name": parts[1]})
+        resp = conn.command(conn.with_port({"cmd": "msg_show", "name": parts[1]}))
         if resp.get("ok") is False:
             print(f"Error: {resp.get('error', '?')}")
             return
@@ -259,21 +276,21 @@ def _cmd_msg(conn: DaemonConnection, rest: str) -> None:
         if len(parts) < 2:
             print("Usage: msg new <name>")
             return
-        resp = conn.command({"cmd": "msg_new", "name": parts[1]})
+        resp = conn.command(conn.with_port({"cmd": "msg_new", "name": parts[1]}))
         _print_response(resp)
 
     elif sub == "delete":
         if len(parts) < 2:
             print("Usage: msg delete <name>")
             return
-        resp = conn.command({"cmd": "msg_delete", "name": parts[1]})
+        resp = conn.command(conn.with_port({"cmd": "msg_delete", "name": parts[1]}))
         _print_response(resp)
 
     elif sub == "clear":
         if len(parts) < 2:
             print("Usage: msg clear <name>")
             return
-        resp = conn.command({"cmd": "msg_clear", "name": parts[1]})
+        resp = conn.command(conn.with_port({"cmd": "msg_clear", "name": parts[1]}))
         _print_response(resp)
 
     elif sub == "add":
@@ -309,7 +326,7 @@ def _cmd_msg(conn: DaemonConnection, rest: str) -> None:
             print(f"Unknown element type {etype!r} — use cw, voice, or tone")
             return
 
-        resp = conn.command({"cmd": "msg_add", "name": name, "element": elem})
+        resp = conn.command(conn.with_port({"cmd": "msg_add", "name": name, "element": elem}))
         _print_response(resp)
 
     else:
@@ -321,10 +338,12 @@ def interactive_shell(conn: DaemonConnection) -> None:
     readline.set_completer(_completer)
     readline.parse_and_bind("tab: complete")
 
-    # Initial status
+    # Initial status — daemon sends this immediately on connect
     try:
-        resp = conn.recv_line()   # daemon sends status on connect
+        resp = conn.recv_line()
         if resp:
+            conn.known_ports  = resp.get("ports", [])
+            conn.current_port = resp.get("port", conn.known_ports[0] if conn.known_ports else "")
             print("Connected to daemon.  Current state:")
             print(" ", _fmt_status(resp))
     except Exception:
@@ -332,12 +351,12 @@ def interactive_shell(conn: DaemonConnection) -> None:
 
     print("Type 'help' for commands.\n")
 
-    # Background subscriber thread for push events
     _subscribe_events(conn)
 
     while True:
+        prompt = f"[{conn.current_port}] rc> " if conn.current_port else "rc> "
         try:
-            line = input("rc> ").strip()
+            line = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -355,8 +374,28 @@ def interactive_shell(conn: DaemonConnection) -> None:
         elif cmd == "help":
             print(__doc__)
 
+        elif cmd == "ports":
+            resp = conn.command({"cmd": "ports"})
+            if resp.get("ok") is False:
+                print(f"Error: {resp.get('error', '?')}")
+            else:
+                conn.known_ports = [p["name"] for p in resp.get("ports", [])]
+                _print_ports(resp)
+
+        elif cmd == "port":
+            name = rest.strip()
+            if not name:
+                print(f"Current port: {conn.current_port or '(none)'}")
+                print(f"Known ports:  {', '.join(conn.known_ports) or '(unknown)'}")
+            elif name not in conn.known_ports and conn.known_ports:
+                print(f"Unknown port {name!r}.  Known: {', '.join(conn.known_ports)}")
+            else:
+                conn.current_port = name
+                resp = conn.command(conn.with_port({"cmd": "state"}))
+                _print_response(resp)
+
         elif cmd == "state":
-            resp = conn.command({"cmd": "state"})
+            resp = conn.command(conn.with_port({"cmd": "state"}))
             _print_response(resp)
 
         elif cmd == "config":
@@ -367,19 +406,19 @@ def interactive_shell(conn: DaemonConnection) -> None:
             if not rest:
                 print("Usage: set <field> <value>  (e.g. 'set hang 2500')")
                 continue
-            resp = conn.command({"cmd": "set", "args": rest})
+            resp = conn.command(conn.with_port({"cmd": "set", "args": rest}))
             _print_response(resp)
 
         elif cmd == "play":
             if not rest:
                 print("Usage: play <message_name>")
                 continue
-            resp = conn.command({"cmd": "play", "msg": rest.strip()})
+            resp = conn.command(conn.with_port({"cmd": "play", "msg": rest.strip()}))
             _print_response(resp)
 
         elif cmd == "ptt":
             active = rest.strip().lower() in ("on", "true", "1", "yes")
-            resp = conn.command({"cmd": "ptt", "active": active})
+            resp = conn.command(conn.with_port({"cmd": "ptt", "active": active}))
             _print_response(resp)
 
         elif cmd == "reload":
@@ -424,7 +463,6 @@ def main() -> None:
                         help="Stream events and exit (non-interactive)")
     args = parser.parse_args()
 
-    # Determine socket path
     socket_path = args.socket
     if not socket_path:
         if args.config and Path(args.config).exists():
