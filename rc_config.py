@@ -57,7 +57,8 @@ class TimerConfig:
 
 
 @dataclass
-class IdentityConfig:
+class EventConfig:
+    """Maps repeater events to the message names that play when they fire."""
     startup_message:        str  = ""
     initial_ids:            list = field(default_factory=list)
     mandatory_ids:          list = field(default_factory=list)
@@ -74,12 +75,12 @@ class IdentityConfig:
 
 @dataclass
 class PortConfig:
-    name:        str            = "port"
-    access_mode: str            = "cor"   # "cor" (COR alone) or "cor_ctcss" (both required)
+    name:        str          = "port"    # set from TOML key [ports.<name>]; not written as a field
+    access_mode: str          = "cor"     # "cor" (COR alone) or "cor_ctcss" (both required)
     hardware:    HardwareConfig = field(default_factory=HardwareConfig)
     audio:       AudioConfig    = field(default_factory=AudioConfig)
     timers:      TimerConfig    = field(default_factory=TimerConfig)
-    identity:    IdentityConfig = field(default_factory=IdentityConfig)
+    events:      EventConfig    = field(default_factory=EventConfig)
 
     def describe(self) -> str:
         t = self.timers
@@ -115,15 +116,15 @@ class PortConfig:
             f"  ID interval    : {t.id_interval:.0f} s",
             f"  ID pending     : {t.id_pending:.0f} s before deadline",
             "",
-            "── Identity ─────────────────────────────────",
-            f"  Initial IDs    : {', '.join(self.identity.initial_ids) or '(none)'}",
-            f"  Mandatory IDs  : {', '.join(self.identity.mandatory_ids) or '(none)'}",
-            f"  Pending ID     : {self.identity.pending_id or '(none)'}",
-            f"  Impolite ID    : {self.identity.impolite_id or '(none)'}",
-            f"  Startup msg    : {self.identity.startup_message or '(none)'}",
-            f"  CT message     : {self.identity.ct_message or '(none)'}",
-            f"  Timeout msg    : {self.identity.timeout_message or '(none)'}",
-            f"  Timeout cancel : {self.identity.timeout_cancel_message or '(not configured)'}",
+            "── Events ───────────────────────────────────",
+            f"  Initial IDs    : {', '.join(self.events.initial_ids) or '(none)'}",
+            f"  Mandatory IDs  : {', '.join(self.events.mandatory_ids) or '(none)'}",
+            f"  Pending ID     : {self.events.pending_id or '(none)'}",
+            f"  Impolite ID    : {self.events.impolite_id or '(none)'}",
+            f"  Startup msg    : {self.events.startup_message or '(none)'}",
+            f"  CT message     : {self.events.ct_message or '(none)'}",
+            f"  Timeout msg    : {self.events.timeout_message or '(none)'}",
+            f"  Timeout cancel : {self.events.timeout_cancel_message or '(not configured)'}",
         ]
         return "\n".join(lines)
 
@@ -169,27 +170,27 @@ class RepeaterConfig:
         for k, v in asdict(self.daemon).items():
             lines.append(f"{k} = {_toml_val(v)}")
 
-        # [messages.*] — global pool, top-level
+        # [messages.*] — global pool
         for msg_name, elems in self.messages.items():
             lines.append("")
             lines.append(f"[messages.{msg_name}]")
             lines.append(f"elements = [{', '.join(_elem_toml(e) for e in elems)}]")
 
-        # [[port]] sections
+        # [ports.<name>] sections — port name is the TOML key, not a field
         for pc in self.ports:
+            n = pc.name
             lines.append("")
-            lines.append("[[port]]")
-            lines.append(f'name = {_toml_val(pc.name)}')
+            lines.append(f"[ports.{n}]")
             lines.append(f'access_mode = {_toml_val(pc.access_mode)}')
 
             for section_name, section_obj in [
                 ("hardware", pc.hardware),
                 ("audio",    pc.audio),
                 ("timers",   pc.timers),
-                ("identity", pc.identity),
+                ("events",   pc.events),
             ]:
                 lines.append("")
-                lines.append(f"[port.{section_name}]")
+                lines.append(f"[ports.{n}.{section_name}]")
                 for k, v in asdict(section_obj).items():
                     lines.append(f"{k} = {_toml_val(v)}")
 
@@ -203,13 +204,13 @@ class RepeaterConfig:
         if "daemon" in data:
             cfg.daemon = _safe_load(DaemonConfig, data["daemon"])
 
-        # Messages are always top-level in both old and new format
         if "messages" in data:
             cfg.messages = _load_messages(data["messages"])
 
-        if "port" in data and isinstance(data["port"], list):
-            for pd in data["port"]:
-                cfg.ports.append(_load_port(pd))
+        # [ports.<name>] — port name comes from the TOML key
+        if "ports" in data and isinstance(data["ports"], dict):
+            for port_name, port_data in data["ports"].items():
+                cfg.ports.append(_load_port(port_data, name=port_name))
 
         if not cfg.ports:
             cfg.ports.append(PortConfig())
@@ -217,22 +218,20 @@ class RepeaterConfig:
         return cfg
 
 
-def _load_port(data: dict, name: str | None = None) -> PortConfig:
+def _load_port(data: dict, name: str) -> PortConfig:
     pc = PortConfig()
-    pc.name = name or data.get("name", "port")
-
-    if "hardware" in data: pc.hardware = _safe_load(HardwareConfig, data["hardware"])
-    if "audio"    in data: pc.audio    = _safe_load(AudioConfig,    data["audio"])
-    if "timers"   in data: pc.timers   = _safe_load(TimerConfig,    data["timers"])
-
-    if "identity" in data:
-        idata = dict(data["identity"])
-        if "hang_message" in idata and "ct_message" not in idata:
-            idata["ct_message"] = idata.pop("hang_message")
-        pc.identity = _safe_load(IdentityConfig, idata)
+    pc.name = name
 
     if "access_mode" in data:
         pc.access_mode = data["access_mode"]
+    if "hardware" in data:
+        pc.hardware = _safe_load(HardwareConfig, data["hardware"])
+    if "audio" in data:
+        pc.audio = _safe_load(AudioConfig, data["audio"])
+    if "timers" in data:
+        pc.timers = _safe_load(TimerConfig, data["timers"])
+    if "events" in data:
+        pc.events = _safe_load(EventConfig, data["events"])
 
     return pc
 
@@ -285,17 +284,6 @@ def _tone_param_str(f1, f2, ms, amp) -> str:
         if isinstance(v, float) and v == int(v): return str(int(v))
         return str(v)
     return f"{_n(f1)}|{_n(f2)}|{int(ms)}|{_n(amp)}"
-
-
-def _elem_display(e: dict) -> str:
-    t = e.get("type", "?")
-    if t == "cw":    return f'CW:{e.get("text","")}'
-    if t == "voice": return f'VOICE:{e.get("clip","")}'
-    if t in ("tone", "ct"):
-        if "freq1" in e:
-            return f'TONE:{_tone_param_str(e["freq1"], e.get("freq2",0), e["ms"], e["amp"])}'
-        return "TONE:?"
-    return repr(e)
 
 
 def _elems_display(elems: list[dict]) -> str:
@@ -381,9 +369,9 @@ _ALIASES: list[tuple[set[str], str, str]] = [
     ({"timeout", "tot"},                                  "timers",   "timeout"),
     ({"id", "interval", "period"},                        "timers",   "id_interval"),
     ({"id", "pending", "warn"},                           "timers",   "id_pending"),
-    # identity
-    ({"ct", "courtesy", "message"},                       "identity", "ct_message"),
-    ({"timeout", "message"},                              "identity", "timeout_message"),
+    # events
+    ({"ct", "courtesy", "message"},                       "events",   "ct_message"),
+    ({"timeout", "message"},                              "events",   "timeout_message"),
     # audio
     ({"morse", "speed", "wpm", "cw"},                     "audio",    "morse_wpm"),
     ({"morse", "pitch", "frequency", "freq", "cw"},       "audio",    "morse_pitch"),

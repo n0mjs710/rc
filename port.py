@@ -112,7 +112,7 @@ class Port:
         # Boot in quiet period — no ID timer until after the first initial ID fires.
         # The initial ID fires at end of hang: startup hang if there is a startup
         # message, otherwise the first user transmission's hang.
-        if self.cfg.identity.startup_message:
+        if self.cfg.events.startup_message:
             loop.create_task(self._play_startup())
         log.info("[%s] Port started — state=IDLE  access=%s",
                  self.name, self.cfg.access_mode)
@@ -286,7 +286,7 @@ class Port:
         lead = self.cfg.timers.id_pending
         # Only arm the sub-timer if a pending_id message is actually configured,
         # and the window is narrower than the full interval.
-        if self.cfg.identity.pending_id and 0 < lead < self.cfg.timers.id_interval:
+        if self.cfg.events.pending_id and 0 < lead < self.cfg.timers.id_interval:
             self._id_sub_timer = self._loop.call_later(
                 self.cfg.timers.id_interval - lead, self._on_id_sub)
 
@@ -303,7 +303,7 @@ class Port:
         self._ct_delay_timer = None
         if self.state != State.TAIL:
             return
-        name = self.cfg.identity.ct_message
+        name = self.cfg.events.ct_message
         if name:
             log.info("CT delay — playing '%s'", name)
             self._play_message(name)
@@ -373,7 +373,7 @@ class Port:
 
     async def _do_timeout_announce(self) -> None:
         """Play the timeout message (PTT already on), then drop PTT."""
-        name = self.cfg.identity.timeout_message
+        name = self.cfg.events.timeout_message
         if name:
             self._play_message(name)
             await self._drain_clips()
@@ -383,7 +383,7 @@ class Port:
     async def _do_timeout_recovery(self) -> None:
         """After timeout clears: play cancel message (if configured), then hang."""
         self._note_tx_start()
-        name = self.cfg.identity.timeout_cancel_message
+        name = self.cfg.events.timeout_cancel_message
         if name:
             self._play_message(name)
             await self._drain_clips()
@@ -409,9 +409,9 @@ class Port:
         Suppresses per-COR-drop CT delays while playing (via _impolite_id_playing);
         fires exactly one CT after the audio drains if COR has dropped by then.
         """
-        name = self.cfg.identity.impolite_id
+        name = self.cfg.events.impolite_id
         if not name:
-            rotation = list(self.cfg.identity.mandatory_ids)
+            rotation = list(self.cfg.events.mandatory_ids)
             if not rotation:
                 log.warning("No impolite or mandatory ID configured")
                 self._last_id_time = self._loop.time()
@@ -437,7 +437,7 @@ class Port:
         # If COR dropped while we were playing, state is TAIL — fire one CT now
         # to acknowledge the QSO, regardless of how many COR cycles happened.
         if self.state == State.TAIL and not self._cor:
-            ct = self.cfg.identity.ct_message
+            ct = self.cfg.events.ct_message
             if ct:
                 self._play_message(ct)
             self._schedule_hang()
@@ -450,7 +450,7 @@ class Port:
         mandatory ID had just fired, then hands off to the normal CT delay.
         """
         epoch = self._id_epoch
-        name = self.cfg.identity.pending_id
+        name = self.cfg.events.pending_id
         if name:
             self._voice_id_active = self._message_has_voice(name)
             self._play_message(name)
@@ -495,7 +495,7 @@ class Port:
         user transmission from quiet period.  No CT is played — CTs are
         user-facing signals that aren't meaningful for system transmissions.
         """
-        msg = self.cfg.identity.startup_message
+        msg = self.cfg.events.startup_message
         if msg not in self._messages:
             log.warning("Startup message '%s' not found in config", msg)
             return
@@ -511,9 +511,9 @@ class Port:
 
     async def _transmit_id(self, id_type: str) -> None:
         if id_type == "initial":
-            rotation = list(self.cfg.identity.initial_ids)
+            rotation = list(self.cfg.events.initial_ids)
         else:
-            rotation = list(self.cfg.identity.mandatory_ids)
+            rotation = list(self.cfg.events.mandatory_ids)
 
         if not rotation:
             log.warning("No %s ID messages configured", id_type)

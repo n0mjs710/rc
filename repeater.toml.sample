@@ -4,7 +4,7 @@ socket_path = "run/rc.sock"    # relative to this config file's directory
 log_level = "INFO"
 
 # Messages are a global pool shared by all ports.
-# Reference them by name in [port.identity] fields.
+# Reference them by name in [ports.<name>.events].
 
 [messages.default_cw]
 elements = [{type = "cw", text = "W0ABC/R"}]
@@ -54,20 +54,20 @@ elements = [
 [messages.piano_chord]
 elements = [{type = "tone", freq1 = 660.0, freq2 = 880.0, ms = 100, amp = 0.7}]
 
-# Each [[port]] section defines one repeater port.
-# Add additional [[port]] sections for multi-port operation.
+# Each [ports.<name>] section defines one repeater port.
+# The key (e.g. "main") is the port's name — used in shell commands and log output.
+# Add additional [ports.<name>] sections for multi-port operation.
 
-[[port]]
-name = "main"
+[ports.main]
 access_mode = "cor"   # "cor" (COR alone) or "cor_ctcss" (both required)
 
-[port.hardware]
+[ports.main.hardware]
 hidraw_device    = ""                     # leave empty for auto-detect by USB VID 0x0d8c
 audio_device     = "USB PnP Sound Device" # must be the same device for duplex RX+TX
 cor_active_low   = true   # true = bit clear means COR active (AllStar/chan_usbradio convention)
 ctcss_active_low = true   # true = bit clear means CTCSS active
 
-[port.audio]
+[ports.main.audio]
 sample_rate         = 48000
 rx_hpf              = true    # 300 Hz high-pass on RX (removes CTCSS/hum)
 rx_deemphasis       = true    # FM de-emphasis on RX audio
@@ -83,7 +83,7 @@ pre_message_ms      = 0       # ms dead air after PTT-on before CW/voice starts 
 post_message_ms     = 0       # ms dead air after audio drains before PTT-off (0 = none)
 ste_delay_ms        = 0       # squelch tail elimination delay in ms (0 = disabled)
 
-[port.timers]
+[ports.main.timers]
 hang        = 2.5     # s — hang time: PTT holdoff after CT ("hangup time")
 ct_delay    = 0.5     # s — delay from RX stream loss to courtesy tone
 kerchunk    = 0.5     # s — minimum COR hold to respond (anti-kerchunk)
@@ -91,12 +91,12 @@ timeout     = 180.0   # s — time-out timer (TOT) transmit cutoff
 id_interval = 600.0   # s — mandatory ID interval (FCC ≤ 10 min)
 id_pending  = 60.0    # s — sneak pending ID this far before the mandatory deadline
 
-[port.identity]
+[ports.main.events]
 startup_message        = ""              # message played at daemon start; leave empty for none
 initial_ids            = ["default_voice"]
 mandatory_ids          = ["default_cw"]
-pending_id             = ""              # single message; snuck in at COR drop before mandatory deadline
-impolite_id            = ""              # single message; played over active QSO if deadline is hit
+pending_id             = ""              # snuck in at COR drop before mandatory deadline
+impolite_id            = ""             # played over active QSO if mandatory deadline hits
 ct_message             = "yellow_jacket"
 timeout_message        = "timeout_warn"
 timeout_cancel_message = ""              # played when TX resumes after a timeout; leave empty for none
