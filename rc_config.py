@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-section dataclasses (unchanged)
+# Per-section dataclasses
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -47,11 +47,6 @@ class AudioConfig:
 
 
 @dataclass
-class CTCSSConfig:
-    access_mode: str = "cor"   # "cor" (COR alone) or "cor_ctcss" (both required)
-
-
-@dataclass
 class TimerConfig:
     hang:        float = 2.5    # s — hangup time: PTT hold after CT
     ct_delay:    float = 0.5    # s — delay from RX loss to courtesy tone
@@ -74,31 +69,23 @@ class IdentityConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-port config (bundles all port-specific sections)
+# Per-port config
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class PortConfig:
-    name:     str            = "port"
-    hardware: HardwareConfig = field(default_factory=HardwareConfig)
-    audio:    AudioConfig    = field(default_factory=AudioConfig)
-    ctcss:    CTCSSConfig    = field(default_factory=CTCSSConfig)
-    timers:   TimerConfig    = field(default_factory=TimerConfig)
-    identity: IdentityConfig = field(default_factory=IdentityConfig)
-    messages: dict           = field(default_factory=dict)
+    name:        str            = "port"
+    access_mode: str            = "cor"   # "cor" (COR alone) or "cor_ctcss" (both required)
+    hardware:    HardwareConfig = field(default_factory=HardwareConfig)
+    audio:       AudioConfig    = field(default_factory=AudioConfig)
+    timers:      TimerConfig    = field(default_factory=TimerConfig)
+    identity:    IdentityConfig = field(default_factory=IdentityConfig)
 
     def describe(self) -> str:
         t = self.timers
         a = self.audio
-
-        msg_lines = []
-        for name in sorted(self.messages):
-            elems    = self.messages[name]
-            elem_str = _elems_display(elems)
-            msg_lines.append(f"  {name:<20}  {elem_str}")
-
         lines = [
-            f"── Port: {self.name} ──────────────────────────────",
+            f"── Port: {self.name}  [access={self.access_mode}] ──────────────────────────────────────────",
             "",
             "── Hardware ─────────────────────────────────",
             f"  HID device     : {self.hardware.hidraw_device or '(auto-detect)'}",
@@ -120,9 +107,6 @@ class PortConfig:
             f"  Post-msg pad   : {a.post_message_ms} ms",
             f"  STE delay      : {a.ste_delay_ms} ms{'' if a.ste_delay_ms else ' (disabled)'}",
             "",
-            "── CTCSS ────────────────────────────────────",
-            f"  Access mode    : {self.ctcss.access_mode}",
-            "",
             "── Timers ───────────────────────────────────",
             f"  Hang           : {t.hang*1000:.0f} ms",
             f"  CT delay       : {t.ct_delay*1000:.0f} ms",
@@ -140,10 +124,7 @@ class PortConfig:
             f"  CT message     : {self.identity.ct_message or '(none)'}",
             f"  Timeout msg    : {self.identity.timeout_message or '(none)'}",
             f"  Timeout cancel : {self.identity.timeout_cancel_message or '(not configured)'}",
-            "",
-            "── Messages ─────────────────────────────────",
-        ] + (msg_lines or ["  (none)"])
-
+        ]
         return "\n".join(lines)
 
 
@@ -153,18 +134,29 @@ class PortConfig:
 
 @dataclass
 class RepeaterConfig:
-    daemon: DaemonConfig = field(default_factory=DaemonConfig)
-    ports:  list         = field(default_factory=list)   # list[PortConfig]
+    daemon:   DaemonConfig = field(default_factory=DaemonConfig)
+    messages: dict         = field(default_factory=dict)   # global pool; shared by all ports
+    ports:    list         = field(default_factory=list)   # list[PortConfig]
 
     def describe(self) -> str:
+        msg_lines = []
+        for name in sorted(self.messages):
+            elems    = self.messages[name]
+            elem_str = _elems_display(elems)
+            msg_lines.append(f"  {name:<20}  {elem_str}")
+
         lines = [
             "── Daemon ───────────────────────────────────",
             f"  Socket         : {self.daemon.socket_path}",
             f"  Log level      : {self.daemon.log_level}",
-        ]
+            "",
+            "── Messages (shared) ────────────────────────",
+        ] + (msg_lines or ["  (none)"])
+
         for pc in self.ports:
             lines.append("")
             lines.append(pc.describe())
+
         return "\n".join(lines)
 
     # ── persistence ──────────────────────────────────────────────────────────
@@ -174,19 +166,25 @@ class RepeaterConfig:
 
         # [daemon]
         lines.append("[daemon]")
-        dc = asdict(self.daemon)
-        for k, v in dc.items():
+        for k, v in asdict(self.daemon).items():
             lines.append(f"{k} = {_toml_val(v)}")
 
+        # [messages.*] — global pool, top-level
+        for msg_name, elems in self.messages.items():
+            lines.append("")
+            lines.append(f"[messages.{msg_name}]")
+            lines.append(f"elements = [{', '.join(_elem_toml(e) for e in elems)}]")
+
+        # [[port]] sections
         for pc in self.ports:
             lines.append("")
             lines.append("[[port]]")
             lines.append(f'name = {_toml_val(pc.name)}')
+            lines.append(f'access_mode = {_toml_val(pc.access_mode)}')
 
             for section_name, section_obj in [
                 ("hardware", pc.hardware),
                 ("audio",    pc.audio),
-                ("ctcss",    pc.ctcss),
                 ("timers",   pc.timers),
                 ("identity", pc.identity),
             ]:
@@ -194,11 +192,6 @@ class RepeaterConfig:
                 lines.append(f"[port.{section_name}]")
                 for k, v in asdict(section_obj).items():
                     lines.append(f"{k} = {_toml_val(v)}")
-
-            for msg_name, elems in pc.messages.items():
-                lines.append("")
-                lines.append(f"[port.messages.{msg_name}]")
-                lines.append(f"elements = [{', '.join(_elem_toml(e) for e in elems)}]")
 
         Path(path).write_text("\n".join(lines) + "\n")
 
@@ -210,14 +203,13 @@ class RepeaterConfig:
         if "daemon" in data:
             cfg.daemon = _safe_load(DaemonConfig, data["daemon"])
 
-        # New format: [[port]] array
+        # Messages are always top-level in both old and new format
+        if "messages" in data:
+            cfg.messages = _load_messages(data["messages"])
+
         if "port" in data and isinstance(data["port"], list):
             for pd in data["port"]:
                 cfg.ports.append(_load_port(pd))
-
-        # Old flat format: [hardware] at top level → auto-migrate as single port
-        elif "hardware" in data or "audio" in data:
-            cfg.ports.append(_load_port(data, name="main"))
 
         if not cfg.ports:
             cfg.ports.append(PortConfig())
@@ -231,7 +223,6 @@ def _load_port(data: dict, name: str | None = None) -> PortConfig:
 
     if "hardware" in data: pc.hardware = _safe_load(HardwareConfig, data["hardware"])
     if "audio"    in data: pc.audio    = _safe_load(AudioConfig,    data["audio"])
-    if "ctcss"    in data: pc.ctcss    = _safe_load(CTCSSConfig,    data["ctcss"])
     if "timers"   in data: pc.timers   = _safe_load(TimerConfig,    data["timers"])
 
     if "identity" in data:
@@ -240,13 +231,17 @@ def _load_port(data: dict, name: str | None = None) -> PortConfig:
             idata["ct_message"] = idata.pop("hang_message")
         pc.identity = _safe_load(IdentityConfig, idata)
 
-    if "messages" in data:
-        pc.messages = {
-            n: [_normalize_element(e) for e in msg.get("elements", [])]
-            for n, msg in data["messages"].items()
-        }
+    if "access_mode" in data:
+        pc.access_mode = data["access_mode"]
 
     return pc
+
+
+def _load_messages(data: dict) -> dict:
+    return {
+        n: [_normalize_element(e) for e in msg.get("elements", [])]
+        for n, msg in data.items()
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,7 +371,8 @@ _NOISE = {"set", "to", "at", "the", "a", "an", "as", "is", "="}
 _BOOL_TRUE  = {"true", "yes", "on", "1", "enable", "enabled"}
 _BOOL_FALSE = {"false", "no", "off", "0", "disable", "disabled"}
 
-# (keyword_set, section, field_name) — sections are attributes of PortConfig
+# (keyword_set, section, field_name)
+# section is a PortConfig attribute name, or "port" for fields directly on PortConfig
 _ALIASES: list[tuple[set[str], str, str]] = [
     # timers
     ({"hang", "hangup", "holdoff"},                       "timers",   "hang"),
@@ -402,8 +398,8 @@ _ALIASES: list[tuple[set[str], str, str]] = [
     ({"rx", "hpf", "highpass"},                           "audio",    "rx_hpf"),
     ({"rx", "deemphasis", "de"},                          "audio",    "rx_deemphasis"),
     ({"tx", "preemphasis", "pre"},                        "audio",    "tx_preemphasis"),
-    # ctcss
-    ({"ctcss", "access", "mode", "activation"},           "ctcss",    "access_mode"),
+    # access (directly on PortConfig)
+    ({"ctcss", "access", "mode", "activation"},           "port",     "access_mode"),
     # hardware
     ({"hidraw", "hid", "device", "path"},                 "hardware", "hidraw_device"),
     ({"audio", "device", "sounddevice"},                  "hardware", "audio_device"),
@@ -447,9 +443,9 @@ def apply_set_command(cfg: PortConfig, args: str) -> str:
         return f"Don't know what field to set from: '{args}'"
 
     section, field_name = best_match
-    ftype        = _FIELD_TYPES.get(field_name, "str")
-    section_obj  = getattr(cfg, section)
-    alias_words  = next(a[0] for a in _ALIASES if a[1] == section and a[2] == field_name)
+    ftype       = _FIELD_TYPES.get(field_name, "str")
+    section_obj = cfg if section == "port" else getattr(cfg, section)
+    alias_words = next(a[0] for a in _ALIASES if a[1] == section and a[2] == field_name)
     value_tokens = [t for t in tokens if t.lower() not in alias_words]
 
     if ftype == "time_ms":
@@ -484,4 +480,6 @@ def apply_set_command(cfg: PortConfig, args: str) -> str:
     setattr(section_obj, field_name, value)
     fmt     = _DISPLAY_UNIT.get(ftype)
     display = fmt(value) if fmt else (repr(value) if isinstance(value, str) else str(value))
-    return f"  {section}.{field_name.replace('_', ' ')} = {display}"
+    label   = field_name.replace("_", " ")
+    prefix  = "" if section == "port" else f"{section}."
+    return f"  {prefix}{label} = {display}"

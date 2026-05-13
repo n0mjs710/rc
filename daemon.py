@@ -93,7 +93,7 @@ class Daemon:
             )
             engine.start()
 
-            port = Port(pc, hw, engine)
+            port = Port(pc, hw, engine, cfg.messages)
             port.add_state_listener(self._make_state_listener(pc.name))
             port.start(self._loop)
             self._ports.append(port)
@@ -200,11 +200,11 @@ class Daemon:
         msg_name = msg.get("msg", "")
         if not msg_name:
             return {"error": "no msg provided"}
+        if msg_name not in self.cfg.messages:
+            return {"error": f"unknown message: {msg_name!r}"}
         port = self._get_port(msg)
         if not port:
             return {"error": "port not running"}
-        if msg_name not in port.cfg.messages:
-            return {"error": f"unknown message: {msg_name!r}"}
         was_ptt = port._engine._ptt
         if not was_ptt:
             port._set_ptt(True)
@@ -228,8 +228,8 @@ class Daemon:
         try:
             new_cfg = RepeaterConfig.load(self._config_path)
             self.cfg = new_cfg
-            # Update each running port's config by matching name
             for port in self._ports:
+                port._messages = new_cfg.messages   # shared global pool
                 for pc in new_cfg.ports:
                     if pc.name == port.name:
                         port.cfg = pc
@@ -243,25 +243,19 @@ class Daemon:
         self._loop.call_soon(self._shutdown_event.set)
         return {}
 
-    # ── message management (per port) ─────────────────────────────────────────
+    # ── message management (global pool) ─────────────────────────────────────
 
     async def _cmd_msg_list(self, msg: dict) -> dict:
-        port = self._get_port(msg)
-        if not port:
-            return {"error": "no port running"}
         return {"messages": {
             name: [e.get("type", "?") for e in elems if isinstance(e, dict)]
-            for name, elems in port.cfg.messages.items()
+            for name, elems in self.cfg.messages.items()
         }}
 
     async def _cmd_msg_show(self, msg: dict) -> dict:
         name = msg.get("name", "")
         if not name:
             return {"error": "no name provided"}
-        port = self._get_port(msg)
-        if not port:
-            return {"error": "no port running"}
-        elems = port.cfg.messages.get(name)
+        elems = self.cfg.messages.get(name)
         if elems is None:
             return {"error": f"message '{name}' not found"}
         return {"name": name, "elements": elems}
@@ -270,39 +264,30 @@ class Daemon:
         name = msg.get("name", "")
         if not name:
             return {"error": "no name provided"}
-        port = self._get_port(msg)
-        if not port:
-            return {"error": "no port running"}
-        if name in port.cfg.messages:
+        if name in self.cfg.messages:
             return {"error": f"message '{name}' already exists"}
-        port.cfg.messages[name] = []
-        log.info("[%s] Message created: '%s'", port.name, name)
+        self.cfg.messages[name] = []
+        log.info("Message created: '%s'", name)
         return {}
 
     async def _cmd_msg_delete(self, msg: dict) -> dict:
         name = msg.get("name", "")
         if not name:
             return {"error": "no name provided"}
-        port = self._get_port(msg)
-        if not port:
-            return {"error": "no port running"}
-        if name not in port.cfg.messages:
+        if name not in self.cfg.messages:
             return {"error": f"message '{name}' not found"}
-        del port.cfg.messages[name]
-        log.info("[%s] Message deleted: '%s'", port.name, name)
+        del self.cfg.messages[name]
+        log.info("Message deleted: '%s'", name)
         return {}
 
     async def _cmd_msg_clear(self, msg: dict) -> dict:
         name = msg.get("name", "")
         if not name:
             return {"error": "no name provided"}
-        port = self._get_port(msg)
-        if not port:
-            return {"error": "no port running"}
-        if name not in port.cfg.messages:
+        if name not in self.cfg.messages:
             return {"error": f"message '{name}' not found"}
-        port.cfg.messages[name] = []
-        log.info("[%s] Message cleared: '%s'", port.name, name)
+        self.cfg.messages[name] = []
+        log.info("Message cleared: '%s'", name)
         return {}
 
     async def _cmd_msg_add(self, msg: dict) -> dict:
@@ -314,13 +299,10 @@ class Daemon:
             return {"error": "element must be a JSON object"}
         if "type" not in elem:
             return {"error": "element must have a 'type' field (cw, voice, tone)"}
-        port = self._get_port(msg)
-        if not port:
-            return {"error": "no port running"}
-        if name not in port.cfg.messages:
-            port.cfg.messages[name] = []
-        port.cfg.messages[name].append(elem)
-        log.info("[%s] Element added to '%s': %r", port.name, name, elem)
+        if name not in self.cfg.messages:
+            self.cfg.messages[name] = []
+        self.cfg.messages[name].append(elem)
+        log.info("Element added to '%s': %r", name, elem)
         return {}
 
 

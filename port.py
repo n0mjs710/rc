@@ -55,11 +55,12 @@ class Port:
     """
 
     def __init__(self, cfg: PortConfig, hw: CM119Hardware,
-                 engine: AudioEngine) -> None:
-        self.cfg    = cfg
-        self.name   = cfg.name
-        self._hw    = hw
-        self._engine = engine
+                 engine: AudioEngine, messages: dict) -> None:
+        self.cfg      = cfg
+        self.name     = cfg.name
+        self._hw      = hw
+        self._engine  = engine
+        self._messages = messages
         self.state  = State.IDLE
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -114,7 +115,7 @@ class Port:
         if self.cfg.identity.startup_message:
             loop.create_task(self._play_startup())
         log.info("[%s] Port started — state=IDLE  access=%s",
-                 self.name, self.cfg.ctcss.access_mode)
+                 self.name, self.cfg.access_mode)
 
     def stop(self) -> None:
         self._hw.remove_cor_callback(self._on_cor_edge)
@@ -149,7 +150,7 @@ class Port:
         self._cor_up_time = self._loop.time()
         self._cancel("hang")
         self._cancel("ct_delay")
-        am = self.cfg.ctcss.access_mode
+        am = self.cfg.access_mode
         log.info("COR ACTIVE  state=%s  access=%s", self.state.name, am)
 
         if am == "cor":
@@ -225,7 +226,7 @@ class Port:
 
     async def _ctcss_active(self) -> None:
         self._ctcss = True
-        am = self.cfg.ctcss.access_mode
+        am = self.cfg.access_mode
         log.info("CTCSS ACTIVE  state=%s  access=%s", self.state.name, am)
 
         if am == "cor_ctcss":
@@ -247,7 +248,7 @@ class Port:
 
     async def _ctcss_idle(self) -> None:
         self._ctcss = False
-        am = self.cfg.ctcss.access_mode
+        am = self.cfg.access_mode
         log.info("CTCSS IDLE  state=%s", self.state.name)
 
         if am == "cor_ctcss" and self.state == State.ACTIVE:
@@ -495,7 +496,7 @@ class Port:
         user-facing signals that aren't meaningful for system transmissions.
         """
         msg = self.cfg.identity.startup_message
-        if msg not in self.cfg.messages:
+        if msg not in self._messages:
             log.warning("Startup message '%s' not found in config", msg)
             return
         log.info("Startup message → '%s'", msg)
@@ -547,7 +548,7 @@ class Port:
                 self._set_ptt(False)
 
     def _play_message(self, name: str) -> None:
-        elements = self.cfg.messages.get(name)
+        elements = self._messages.get(name)
         if elements is None:
             log.error("Message '%s' not found in config", name)
             return
@@ -610,11 +611,11 @@ class Port:
 
     def _message_has_voice(self, name: str) -> bool:
         return any(e.get("type") == "voice"
-                   for e in self.cfg.messages.get(name, []))
+                   for e in self._messages.get(name, []))
 
     def _message_needs_padding(self, name: str) -> bool:
         return any(e.get("type") in ("cw", "voice")
-                   for e in self.cfg.messages.get(name, []))
+                   for e in self._messages.get(name, []))
 
     def _note_tx_start(self) -> None:
         """Record that the transmitter is going active for a non-ID reason.
@@ -649,7 +650,7 @@ class Port:
         if self.state == State.TIMEOUT:
             self._set_passthrough(False)
             return
-        am = self.cfg.ctcss.access_mode
+        am = self.cfg.access_mode
         if am == "cor_ctcss":
             active = self._cor and self._ctcss
         else:
@@ -731,5 +732,5 @@ class Port:
             "cor":    self._cor,
             "ctcss":  self._ctcss,
             "ptt":    self._engine._ptt,
-            "access": self.cfg.ctcss.access_mode,
+            "access": self.cfg.access_mode,
         }
