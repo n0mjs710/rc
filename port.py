@@ -28,7 +28,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Callable
 
-from rc_config import RepeaterConfig
+from rc_config import PortConfig
 from hardware  import CM119Hardware
 from audio_engine import AudioEngine, VocabCache
 from tones import render_tone
@@ -54,9 +54,10 @@ class Port:
     call_soon_threadsafe).
     """
 
-    def __init__(self, cfg: RepeaterConfig, hw: CM119Hardware,
+    def __init__(self, cfg: PortConfig, hw: CM119Hardware,
                  engine: AudioEngine) -> None:
         self.cfg    = cfg
+        self.name   = cfg.name
         self._hw    = hw
         self._engine = engine
         self.state  = State.IDLE
@@ -112,7 +113,8 @@ class Port:
         # message, otherwise the first user transmission's hang.
         if self.cfg.identity.startup_message:
             loop.create_task(self._play_startup())
-        log.info("Port started — state=IDLE  access=%s", self.cfg.ctcss.access_mode)
+        log.info("[%s] Port started — state=IDLE  access=%s",
+                 self.name, self.cfg.ctcss.access_mode)
 
     def stop(self) -> None:
         self._hw.remove_cor_callback(self._on_cor_edge)
@@ -120,7 +122,7 @@ class Port:
         for name in ("hang", "ct_delay", "timeout", "ctcss", "id", "id_sub"):
             self._cancel(name)
         self._set_ptt(False)
-        log.info("Port stopped.")
+        log.info("[%s] Port stopped.", self.name)
 
     # ── hardware edge callbacks (called from HID reader thread) ───────────────
 

@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config sections
+# Per-section dataclasses (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -22,28 +22,28 @@ class DaemonConfig:
 
 @dataclass
 class HardwareConfig:
-    hidraw_device:   str  = ""    # empty = auto-detect by VID
-    audio_device:    str  = ""    # sounddevice name/index; empty = system default
-    cor_active_low:  bool = True  # True = bit clear means COR active (AllStar/chan_usbradio convention)
-    ctcss_active_low: bool = True # True = bit clear means CTCSS active
+    hidraw_device:    str  = ""    # empty = auto-detect by VID
+    audio_device:     str  = ""    # sounddevice name/index; empty = system default
+    cor_active_low:   bool = True  # True = bit clear means COR active (AllStar convention)
+    ctcss_active_low: bool = True  # True = bit clear means CTCSS active
 
 
 @dataclass
 class AudioConfig:
-    sample_rate:         int   = 48_000
-    rx_hpf:              bool  = True    # 300 Hz HPF on RX (removes sub-audible)
-    rx_deemphasis:       bool  = True    # FM de-emphasis on RX audio
-    tx_preemphasis:      bool  = False   # FM pre-emphasis on TX mix
-    repeat_gain:         float = 1.0    # RX passthrough gain multiplier
+    sample_rate:          int   = 48_000
+    rx_hpf:               bool  = True    # 300 Hz HPF on RX (removes sub-audible)
+    rx_deemphasis:        bool  = True    # FM de-emphasis on RX audio
+    tx_preemphasis:       bool  = False   # FM pre-emphasis on TX mix
+    repeat_gain:          float = 1.0     # RX passthrough gain multiplier
     morse_wpm:            int   = 20
     morse_pitch:          int   = 700
     morse_level:          float = 0.9
-    impolite_morse_level: float = 0.3    # CW level when IDing over an active QSO
+    impolite_morse_level: float = 0.3     # CW level when IDing over an active QSO
     voice_level:          float = 0.9
-    voice_blocks_repeat:  bool  = False  # mute RX passthrough during VOICE clips
-    pre_message_ms:       int   = 0      # dead air after PTT-on, before first CW/voice sample
-    post_message_ms:      int   = 0      # dead air after last sample drains, before PTT-off
-    ste_delay_ms:         int   = 0      # squelch tail elimination delay (0 = disabled)
+    voice_blocks_repeat:  bool  = False   # mute RX passthrough during VOICE clips
+    pre_message_ms:       int   = 0       # dead air after PTT-on, before first CW/voice sample
+    post_message_ms:      int   = 0       # dead air after last sample drains, before PTT-off
+    ste_delay_ms:         int   = 0       # squelch tail elimination delay (0 = disabled)
 
 
 @dataclass
@@ -53,7 +53,7 @@ class CTCSSConfig:
 
 @dataclass
 class TimerConfig:
-    hang:        float = 2.5    # s — hangup time: PTT hold after CT (how long before TX "hangs up")
+    hang:        float = 2.5    # s — hangup time: PTT hold after CT
     ct_delay:    float = 0.5    # s — delay from RX loss to courtesy tone
     kerchunk:    float = 0.5    # s — minimum COR hold to respond
     timeout:     float = 180.0  # s — TOT transmit cutoff
@@ -73,137 +73,38 @@ class IdentityConfig:
     timeout_cancel_message: str  = ""
 
 
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# TOML serialiser (minimal — enough for save())
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _toml_val(v) -> str:
-    if isinstance(v, bool):  return "true" if v else "false"
-    if isinstance(v, str):   return f'"{v}"'
-    if isinstance(v, list):  return "[" + ", ".join(_toml_val(i) for i in v) + "]"
-    if isinstance(v, float): return repr(v)
-    return str(v)
-
-
-def _dict_to_toml(d: dict) -> str:
-    lines: list[str] = []
-    sections: list[tuple[str, dict]] = []
-
-    for k, v in d.items():
-        if isinstance(v, dict):
-            sections.append((k, v))
-        else:
-            lines.append(f"{k} = {_toml_val(v)}")
-
-    for name, section in sections:
-        lines.append(f"\n[{name}]")
-        for k, v in section.items():
-            if isinstance(v, dict):
-                # nested sub-tables (e.g. messages) written inline
-                lines.append(f"\n[{name}.{k}]")
-                for kk, vv in v.items():
-                    lines.append(f"{kk} = {_toml_val(vv)}")
-            else:
-                lines.append(f"{k} = {_toml_val(v)}")
-
-    return "\n".join(lines) + "\n"
-
-
-def _safe_load(cls, data: dict):
-    """Construct a dataclass from a dict, silently ignoring unknown keys."""
-    known = {f.name for f in dc_fields(cls)}
-    return cls(**{k: v for k, v in data.items() if k in known})
-
-
-def _normalize_element(e: dict) -> dict:
-    """Map legacy element types to current names."""
-    if e.get("type") == "ct":
-        return {**e, "type": "tone"}
-    return e
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Top-level config object
+# Per-port config (bundles all port-specific sections)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class RepeaterConfig:
-    daemon:         DaemonConfig   = field(default_factory=DaemonConfig)
-    hardware:       HardwareConfig = field(default_factory=HardwareConfig)
-    audio:          AudioConfig    = field(default_factory=AudioConfig)
-    ctcss:          CTCSSConfig    = field(default_factory=CTCSSConfig)
-    timers:         TimerConfig    = field(default_factory=TimerConfig)
-    identity:       IdentityConfig = field(default_factory=IdentityConfig)
-    messages:       dict = field(default_factory=dict)
-
-    # ── persistence ──────────────────────────────────────────────────────────
-
-    def to_dict(self) -> dict:
-        return {
-            "daemon":   asdict(self.daemon),
-            "hardware": asdict(self.hardware),
-            "audio":    asdict(self.audio),
-            "ctcss":    asdict(self.ctcss),
-            "timers":   asdict(self.timers),
-            "identity": asdict(self.identity),
-            "messages": {
-                name: {"elements": elems}
-                for name, elems in self.messages.items()
-            },
-        }
-
-    def save(self, path: str | Path) -> None:
-        Path(path).write_text(_dict_to_toml(self.to_dict()))
-
-    @classmethod
-    def load(cls, path: str | Path) -> "RepeaterConfig":
-        data = tomllib.loads(Path(path).read_text())
-        cfg  = cls()
-
-        if "daemon"   in data: cfg.daemon   = _safe_load(DaemonConfig,   data["daemon"])
-        if "hardware" in data: cfg.hardware = _safe_load(HardwareConfig, data["hardware"])
-        if "audio"    in data: cfg.audio    = _safe_load(AudioConfig,     data["audio"])
-        if "ctcss"    in data: cfg.ctcss    = _safe_load(CTCSSConfig,     data["ctcss"])
-        if "timers"   in data: cfg.timers   = _safe_load(TimerConfig,     data["timers"])
-
-        if "identity" in data:
-            idata = dict(data["identity"])
-            # backward compat
-            if "hang_message" in idata and "ct_message" not in idata:
-                idata["ct_message"] = idata.pop("hang_message")
-            cfg.identity = _safe_load(IdentityConfig, idata)
-
-        if "messages" in data:
-            cfg.messages = {
-                name: [_normalize_element(e) for e in msg.get("elements", [])]
-                for name, msg in data["messages"].items()
-            }
-
-        return cfg
+class PortConfig:
+    name:     str            = "port"
+    hardware: HardwareConfig = field(default_factory=HardwareConfig)
+    audio:    AudioConfig    = field(default_factory=AudioConfig)
+    ctcss:    CTCSSConfig    = field(default_factory=CTCSSConfig)
+    timers:   TimerConfig    = field(default_factory=TimerConfig)
+    identity: IdentityConfig = field(default_factory=IdentityConfig)
+    messages: dict           = field(default_factory=dict)
 
     def describe(self) -> str:
-        c = self
-        t = c.timers
-        a = c.audio
+        t = self.timers
+        a = self.audio
 
         msg_lines = []
-        for name in sorted(c.messages):
-            elems    = c.messages[name]
+        for name in sorted(self.messages):
+            elems    = self.messages[name]
             elem_str = _elems_display(elems)
             msg_lines.append(f"  {name:<20}  {elem_str}")
 
         lines = [
-            "── Daemon ───────────────────────────────────",
-            f"  Socket         : {c.daemon.socket_path}",
-            f"  Log level      : {c.daemon.log_level}",
+            f"── Port: {self.name} ──────────────────────────────",
             "",
             "── Hardware ─────────────────────────────────",
-            f"  HID device     : {c.hardware.hidraw_device or '(auto-detect)'}",
-            f"  Audio device   : {c.hardware.audio_device or '(system default)'}",
-            f"  COR polarity   : {'active-low' if c.hardware.cor_active_low else 'active-high'}",
-            f"  CTCSS polarity : {'active-low' if c.hardware.ctcss_active_low else 'active-high'}",
+            f"  HID device     : {self.hardware.hidraw_device or '(auto-detect)'}",
+            f"  Audio device   : {self.hardware.audio_device or '(system default)'}",
+            f"  COR polarity   : {'active-low' if self.hardware.cor_active_low else 'active-high'}",
+            f"  CTCSS polarity : {'active-low' if self.hardware.ctcss_active_low else 'active-high'}",
             "",
             "── Audio ────────────────────────────────────",
             f"  Sample rate    : {a.sample_rate} Hz",
@@ -220,7 +121,7 @@ class RepeaterConfig:
             f"  STE delay      : {a.ste_delay_ms} ms{'' if a.ste_delay_ms else ' (disabled)'}",
             "",
             "── CTCSS ────────────────────────────────────",
-            f"  Access mode    : {c.ctcss.access_mode}",
+            f"  Access mode    : {self.ctcss.access_mode}",
             "",
             "── Timers ───────────────────────────────────",
             f"  Hang           : {t.hang*1000:.0f} ms",
@@ -231,14 +132,14 @@ class RepeaterConfig:
             f"  ID pending     : {t.id_pending:.0f} s before deadline",
             "",
             "── Identity ─────────────────────────────────",
-            f"  Initial IDs    : {', '.join(c.identity.initial_ids) or '(none)'}",
-            f"  Mandatory IDs  : {', '.join(c.identity.mandatory_ids) or '(none)'}",
-            f"  Pending ID     : {c.identity.pending_id or '(none)'}",
-            f"  Impolite ID    : {c.identity.impolite_id or '(none)'}",
-            f"  Startup msg    : {c.identity.startup_message or '(none)'}",
-            f"  CT message     : {c.identity.ct_message or '(none)'}",
-            f"  Timeout msg    : {c.identity.timeout_message or '(none)'}",
-            f"  Timeout cancel : {c.identity.timeout_cancel_message or '(not configured)'}",
+            f"  Initial IDs    : {', '.join(self.identity.initial_ids) or '(none)'}",
+            f"  Mandatory IDs  : {', '.join(self.identity.mandatory_ids) or '(none)'}",
+            f"  Pending ID     : {self.identity.pending_id or '(none)'}",
+            f"  Impolite ID    : {self.identity.impolite_id or '(none)'}",
+            f"  Startup msg    : {self.identity.startup_message or '(none)'}",
+            f"  CT message     : {self.identity.ct_message or '(none)'}",
+            f"  Timeout msg    : {self.identity.timeout_message or '(none)'}",
+            f"  Timeout cancel : {self.identity.timeout_cancel_message or '(not configured)'}",
             "",
             "── Messages ─────────────────────────────────",
         ] + (msg_lines or ["  (none)"])
@@ -247,7 +148,141 @@ class RepeaterConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Element display helpers (used in describe() and shell)
+# Top-level config object
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class RepeaterConfig:
+    daemon: DaemonConfig = field(default_factory=DaemonConfig)
+    ports:  list         = field(default_factory=list)   # list[PortConfig]
+
+    def describe(self) -> str:
+        lines = [
+            "── Daemon ───────────────────────────────────",
+            f"  Socket         : {self.daemon.socket_path}",
+            f"  Log level      : {self.daemon.log_level}",
+        ]
+        for pc in self.ports:
+            lines.append("")
+            lines.append(pc.describe())
+        return "\n".join(lines)
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def save(self, path: str | Path) -> None:
+        lines: list[str] = []
+
+        # [daemon]
+        lines.append("[daemon]")
+        dc = asdict(self.daemon)
+        for k, v in dc.items():
+            lines.append(f"{k} = {_toml_val(v)}")
+
+        for pc in self.ports:
+            lines.append("")
+            lines.append("[[port]]")
+            lines.append(f'name = {_toml_val(pc.name)}')
+
+            for section_name, section_obj in [
+                ("hardware", pc.hardware),
+                ("audio",    pc.audio),
+                ("ctcss",    pc.ctcss),
+                ("timers",   pc.timers),
+                ("identity", pc.identity),
+            ]:
+                lines.append("")
+                lines.append(f"[port.{section_name}]")
+                for k, v in asdict(section_obj).items():
+                    lines.append(f"{k} = {_toml_val(v)}")
+
+            for msg_name, elems in pc.messages.items():
+                lines.append("")
+                lines.append(f"[port.messages.{msg_name}]")
+                lines.append(f"elements = [{', '.join(_elem_toml(e) for e in elems)}]")
+
+        Path(path).write_text("\n".join(lines) + "\n")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "RepeaterConfig":
+        data = tomllib.loads(Path(path).read_text())
+        cfg  = cls()
+
+        if "daemon" in data:
+            cfg.daemon = _safe_load(DaemonConfig, data["daemon"])
+
+        # New format: [[port]] array
+        if "port" in data and isinstance(data["port"], list):
+            for pd in data["port"]:
+                cfg.ports.append(_load_port(pd))
+
+        # Old flat format: [hardware] at top level → auto-migrate as single port
+        elif "hardware" in data or "audio" in data:
+            cfg.ports.append(_load_port(data, name="main"))
+
+        if not cfg.ports:
+            cfg.ports.append(PortConfig())
+
+        return cfg
+
+
+def _load_port(data: dict, name: str | None = None) -> PortConfig:
+    pc = PortConfig()
+    pc.name = name or data.get("name", "port")
+
+    if "hardware" in data: pc.hardware = _safe_load(HardwareConfig, data["hardware"])
+    if "audio"    in data: pc.audio    = _safe_load(AudioConfig,    data["audio"])
+    if "ctcss"    in data: pc.ctcss    = _safe_load(CTCSSConfig,    data["ctcss"])
+    if "timers"   in data: pc.timers   = _safe_load(TimerConfig,    data["timers"])
+
+    if "identity" in data:
+        idata = dict(data["identity"])
+        if "hang_message" in idata and "ct_message" not in idata:
+            idata["ct_message"] = idata.pop("hang_message")
+        pc.identity = _safe_load(IdentityConfig, idata)
+
+    if "messages" in data:
+        pc.messages = {
+            n: [_normalize_element(e) for e in msg.get("elements", [])]
+            for n, msg in data["messages"].items()
+        }
+
+    return pc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOML helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _toml_val(v) -> str:
+    if isinstance(v, bool):  return "true" if v else "false"
+    if isinstance(v, str):   return f'"{v}"'
+    if isinstance(v, list):  return "[" + ", ".join(_toml_val(i) for i in v) + "]"
+    if isinstance(v, float): return repr(v)
+    return str(v)
+
+
+def _elem_toml(e: dict) -> str:
+    """Serialise a message element as an inline TOML table."""
+    parts = []
+    for k, v in e.items():
+        parts.append(f"{k} = {_toml_val(v)}")
+    return "{" + ", ".join(parts) + "}"
+
+
+def _safe_load(cls, data: dict):
+    """Construct a dataclass from a dict, ignoring unknown keys."""
+    known = {f.name for f in dc_fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def _normalize_element(e: dict) -> dict:
+    if e.get("type") == "ct":
+        return {**e, "type": "tone"}
+    return e
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Element display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tone_param_str(f1, f2, ms, amp) -> str:
@@ -264,7 +299,7 @@ def _elem_display(e: dict) -> str:
     if t in ("tone", "ct"):
         if "freq1" in e:
             return f'TONE:{_tone_param_str(e["freq1"], e.get("freq2",0), e["ms"], e["amp"])}'
-        return f'TONE:?'
+        return "TONE:?"
     return repr(e)
 
 
@@ -276,12 +311,11 @@ def _elems_display(elems: list[dict]) -> str:
     for e in elems:
         t    = e.get("type", "?")
         norm = "tone" if t in ("tone", "ct") else t
-        if norm == "voice":   val = e.get("clip", "")
-        elif norm == "cw":    val = e.get("text", "")
+        if norm == "voice":  val = e.get("clip", "")
+        elif norm == "cw":   val = e.get("text", "")
         elif norm == "tone":
-            if "freq1" in e:
-                val = _tone_param_str(e["freq1"], e.get("freq2",0), e["ms"], e["amp"])
-            else: val = "?"
+            val = _tone_param_str(e["freq1"], e.get("freq2", 0), e["ms"], e["amp"]) \
+                  if "freq1" in e else "?"
         else:
             parts.append(repr(e)); prev_type = None; continue
         if norm == prev_type:
@@ -293,7 +327,7 @@ def _elems_display(elems: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# "set" command parser (used by the shell via the daemon API)
+# "set" command parser  (operates on a single PortConfig)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TIME_UNITS = {
@@ -342,12 +376,12 @@ _NOISE = {"set", "to", "at", "the", "a", "an", "as", "is", "="}
 _BOOL_TRUE  = {"true", "yes", "on", "1", "enable", "enabled"}
 _BOOL_FALSE = {"false", "no", "off", "0", "disable", "disabled"}
 
-# (keyword_set, section, field_name)
+# (keyword_set, section, field_name) — sections are attributes of PortConfig
 _ALIASES: list[tuple[set[str], str, str]] = [
-    # timers (ms fields: bare number = ms)
+    # timers
     ({"hang", "hangup", "holdoff"},                       "timers",   "hang"),
     ({"ct", "delay", "courtesy", "pre"},                  "timers",   "ct_delay"),
-    ({"kerchunk", "kerchunk", "minimum"},                 "timers",   "kerchunk"),
+    ({"kerchunk", "minimum"},                             "timers",   "kerchunk"),
     ({"timeout", "tot"},                                  "timers",   "timeout"),
     ({"id", "interval", "period"},                        "timers",   "id_interval"),
     ({"id", "pending", "warn"},                           "timers",   "id_pending"),
@@ -373,9 +407,6 @@ _ALIASES: list[tuple[set[str], str, str]] = [
     # hardware
     ({"hidraw", "hid", "device", "path"},                 "hardware", "hidraw_device"),
     ({"audio", "device", "sounddevice"},                  "hardware", "audio_device"),
-    # daemon
-    ({"socket", "path", "sock"},                          "daemon",   "socket_path"),
-    ({"log", "level"},                                    "daemon",   "log_level"),
 ]
 
 _FIELD_TYPES: dict[str, str] = {
@@ -390,7 +421,6 @@ _FIELD_TYPES: dict[str, str] = {
     "access_mode": "str",
     "ct_message": "str", "timeout_message": "str",
     "hidraw_device": "str", "audio_device": "str",
-    "socket_path": "str", "log_level": "str",
 }
 
 _DISPLAY_UNIT = {
@@ -399,8 +429,8 @@ _DISPLAY_UNIT = {
 }
 
 
-def apply_set_command(cfg: RepeaterConfig, args: str) -> str:
-    """Parse and apply a natural-language 'set' command; return result string."""
+def apply_set_command(cfg: PortConfig, args: str) -> str:
+    """Parse and apply a natural-language 'set' command to a port; return result string."""
     tokens = [t for t in re.split(r"\s+", args.strip()) if t.lower() not in _NOISE]
     if not tokens:
         return "Nothing to set."

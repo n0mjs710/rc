@@ -23,10 +23,9 @@ import os
 import signal
 import socket
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
-from rc_config import RepeaterConfig, apply_set_command
+from rc_config import RepeaterConfig, PortConfig, apply_set_command
 from hardware  import CM119Hardware
 from audio_engine import AudioEngine
 from port      import Port
@@ -58,49 +57,46 @@ def _sd_notify(msg: str) -> None:
 
 class Daemon:
     def __init__(self, cfg: RepeaterConfig, config_path: str | None) -> None:
-        self.cfg         = cfg
+        self.cfg          = cfg
         self._config_path = config_path
-        self._port:   Port | None       = None
-        self._engine: AudioEngine | None = None
-        self._hw:     CM119Hardware | None = None
-        self._api:    APIServer | None   = None
-        self._loop:   asyncio.AbstractEventLoop | None = None
+        self._ports: list[Port] = []
+        self._api:   APIServer | None = None
+        self._loop:  asyncio.AbstractEventLoop | None = None
         self._shutdown_event = asyncio.Event()
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
 
-        # Hardware
-        self._hw = CM119Hardware(
-            self.cfg.hardware.hidraw_device,
-            cor_active_low   = self.cfg.hardware.cor_active_low,
-            ctcss_active_low = self.cfg.hardware.ctcss_active_low,
-        )
-        self._hw.open()
-        log.info("CM119 opened — hidraw: %s",
-                 self.cfg.hardware.hidraw_device or "(auto)")
+        for pc in self.cfg.ports:
+            hw = CM119Hardware(
+                pc.hardware.hidraw_device,
+                cor_active_low   = pc.hardware.cor_active_low,
+                ctcss_active_low = pc.hardware.ctcss_active_low,
+            )
+            hw.open()
+            log.info("[%s] CM119 opened — hidraw: %s",
+                     pc.name, pc.hardware.hidraw_device or "(auto)")
 
-        # Audio engine
-        ac = self.cfg.audio
-        audio_dev = self.cfg.hardware.audio_device or None  # None = system default
-        self._engine = AudioEngine(
-            sample_rate         = ac.sample_rate,
-            blocksize           = ac.sample_rate // 50,   # 20 ms
-            input_device        = audio_dev,
-            output_device       = audio_dev,
-            rx_hpf              = ac.rx_hpf,
-            rx_deemphasis       = ac.rx_deemphasis,
-            tx_preemphasis      = ac.tx_preemphasis,
-            repeat_gain         = ac.repeat_gain,
-            voice_blocks_repeat = ac.voice_blocks_repeat,
-            ste_delay_ms        = ac.ste_delay_ms,
-        )
-        self._engine.start()
+            ac        = pc.audio
+            audio_dev = pc.hardware.audio_device or None
+            engine    = AudioEngine(
+                sample_rate         = ac.sample_rate,
+                blocksize           = ac.sample_rate // 50,   # 20 ms
+                input_device        = audio_dev,
+                output_device       = audio_dev,
+                rx_hpf              = ac.rx_hpf,
+                rx_deemphasis       = ac.rx_deemphasis,
+                tx_preemphasis      = ac.tx_preemphasis,
+                repeat_gain         = ac.repeat_gain,
+                voice_blocks_repeat = ac.voice_blocks_repeat,
+                ste_delay_ms        = ac.ste_delay_ms,
+            )
+            engine.start()
 
-        # Port state machine
-        self._port = Port(self.cfg, self._hw, self._engine)
-        self._port.add_state_listener(self._on_port_state_change)
-        self._port.start(self._loop)
+            port = Port(pc, hw, engine)
+            port.add_state_listener(self._make_state_listener(pc.name))
+            port.start(self._loop)
+            self._ports.append(port)
 
         # API server
         self._api = APIServer(self.cfg.daemon.socket_path)
@@ -119,8 +115,9 @@ class Daemon:
         self._api.register("msg_add",    self._cmd_msg_add)
         await self._api.start()
 
-        log.info("Daemon ready — socket: %s  access: %s",
-                 self.cfg.daemon.socket_path, self.cfg.ctcss.access_mode)
+        port_names = ", ".join(p.name for p in self._ports)
+        log.info("Daemon ready — socket: %s  ports: [%s]",
+                 self.cfg.daemon.socket_path, port_names)
         _sd_notify("READY=1")
 
         await self._shutdown_event.wait()
@@ -129,17 +126,14 @@ class Daemon:
         log.info("Shutting down daemon…")
         _sd_notify("STOPPING=1")
 
-        if self._port:
-            self._port.stop()
-        if self._engine:
-            self._engine.stop()
-        if self._hw:
-            self._hw.close()
+        for port in self._ports:
+            port.stop()
+            port._engine.stop()
+            port._hw.close()
+
         if self._api:
             await self._api.stop()
 
-        # Cancel any background tasks the port spawned (drain_clips loops, ID
-        # transmissions, etc.) that are still awaiting after hardware is stopped.
         current = asyncio.current_task()
         pending = [t for t in asyncio.all_tasks() if t is not current]
         for t in pending:
@@ -149,56 +143,89 @@ class Daemon:
 
         log.info("Daemon stopped.")
 
+    # ── port lookup ────────────────────────────────────────────────────────────
+
+    def _get_port(self, msg: dict | None) -> Port | None:
+        """Return the port addressed by msg["port"] (name), or the first port."""
+        if not self._ports:
+            return None
+        port_name = msg.get("port") if msg else None
+        if port_name:
+            for p in self._ports:
+                if p.name == port_name:
+                    return p
+            return None
+        return self._ports[0]
+
+    # ── state-change → push event ─────────────────────────────────────────────
+
+    def _make_state_listener(self, port_name: str):
+        def _cb(status: dict) -> None:
+            if self._api:
+                self._api.push_event(
+                    {"event": "status", "port": port_name, **status}
+                )
+        return _cb
+
     # ── API command handlers ───────────────────────────────────────────────────
 
     async def _cmd_state(self, msg: dict | None = None) -> dict:
-        if not self._port:
+        port = self._get_port(msg)
+        if not port:
             return {"state": "NOT_RUNNING"}
-        return self._port.get_status()
+        return {"port": port.name, **port.get_status()}
 
     async def _cmd_config(self, msg: dict) -> dict:
-        return {"config": self.cfg.to_dict()}
+        return {"result": self.cfg.describe()}
 
     async def _cmd_set(self, msg: dict) -> dict:
         args = msg.get("args", "")
         if not args:
             return {"error": "no args provided"}
-        result = apply_set_command(self.cfg, args)
+        port = self._get_port(msg)
+        if not port:
+            return {"error": "no port running"}
+        result = apply_set_command(port.cfg, args)
         return {"result": result}
 
     async def _cmd_play(self, msg: dict) -> dict:
         msg_name = msg.get("msg", "")
         if not msg_name:
             return {"error": "no msg provided"}
-        if not self._port:
+        port = self._get_port(msg)
+        if not port:
             return {"error": "port not running"}
-        if msg_name not in self.cfg.messages:
+        if msg_name not in port.cfg.messages:
             return {"error": f"unknown message: {msg_name!r}"}
-        was_ptt = self._engine._ptt
+        was_ptt = port._engine._ptt
         if not was_ptt:
-            self._port._set_ptt(True)
-        self._port._play_message(msg_name)
+            port._set_ptt(True)
+        port._play_message(msg_name)
         if not was_ptt:
-            while self._engine.is_playing():
+            while port._engine.is_playing():
                 await asyncio.sleep(0.05)
-            self._port._set_ptt(False)
+            port._set_ptt(False)
         return {}
 
     async def _cmd_ptt(self, msg: dict) -> dict:
         active = bool(msg.get("active", False))
-        if self._hw:
-            self._hw.set_ptt(active)
-        if self._engine:
-            self._engine.set_ptt(active)
+        port = self._get_port(msg)
+        if port:
+            port._set_ptt(active)
         return {"ptt": active}
 
     async def _cmd_reload(self, msg: dict) -> dict:
         if not self._config_path:
             return {"error": "no config file to reload"}
         try:
-            self.cfg = RepeaterConfig.load(self._config_path)
-            if self._port:
-                self._port.cfg = self.cfg
+            new_cfg = RepeaterConfig.load(self._config_path)
+            self.cfg = new_cfg
+            # Update each running port's config by matching name
+            for port in self._ports:
+                for pc in new_cfg.ports:
+                    if pc.name == port.name:
+                        port.cfg = pc
+                        break
             log.info("Config reloaded from %s", self._config_path)
             return {"reloaded": True}
         except Exception as exc:
@@ -208,19 +235,25 @@ class Daemon:
         self._loop.call_soon(self._shutdown_event.set)
         return {}
 
-    # ── message management ────────────────────────────────────────────────────
+    # ── message management (per port) ─────────────────────────────────────────
 
     async def _cmd_msg_list(self, msg: dict) -> dict:
+        port = self._get_port(msg)
+        if not port:
+            return {"error": "no port running"}
         return {"messages": {
             name: [e.get("type", "?") for e in elems if isinstance(e, dict)]
-            for name, elems in self.cfg.messages.items()
+            for name, elems in port.cfg.messages.items()
         }}
 
     async def _cmd_msg_show(self, msg: dict) -> dict:
         name = msg.get("name", "")
         if not name:
             return {"error": "no name provided"}
-        elems = self.cfg.messages.get(name)
+        port = self._get_port(msg)
+        if not port:
+            return {"error": "no port running"}
+        elems = port.cfg.messages.get(name)
         if elems is None:
             return {"error": f"message '{name}' not found"}
         return {"name": name, "elements": elems}
@@ -229,30 +262,39 @@ class Daemon:
         name = msg.get("name", "")
         if not name:
             return {"error": "no name provided"}
-        if name in self.cfg.messages:
+        port = self._get_port(msg)
+        if not port:
+            return {"error": "no port running"}
+        if name in port.cfg.messages:
             return {"error": f"message '{name}' already exists"}
-        self.cfg.messages[name] = []
-        log.info("Message created: '%s'", name)
+        port.cfg.messages[name] = []
+        log.info("[%s] Message created: '%s'", port.name, name)
         return {}
 
     async def _cmd_msg_delete(self, msg: dict) -> dict:
         name = msg.get("name", "")
         if not name:
             return {"error": "no name provided"}
-        if name not in self.cfg.messages:
+        port = self._get_port(msg)
+        if not port:
+            return {"error": "no port running"}
+        if name not in port.cfg.messages:
             return {"error": f"message '{name}' not found"}
-        del self.cfg.messages[name]
-        log.info("Message deleted: '%s'", name)
+        del port.cfg.messages[name]
+        log.info("[%s] Message deleted: '%s'", port.name, name)
         return {}
 
     async def _cmd_msg_clear(self, msg: dict) -> dict:
         name = msg.get("name", "")
         if not name:
             return {"error": "no name provided"}
-        if name not in self.cfg.messages:
+        port = self._get_port(msg)
+        if not port:
+            return {"error": "no port running"}
+        if name not in port.cfg.messages:
             return {"error": f"message '{name}' not found"}
-        self.cfg.messages[name] = []
-        log.info("Message cleared: '%s'", name)
+        port.cfg.messages[name] = []
+        log.info("[%s] Message cleared: '%s'", port.name, name)
         return {}
 
     async def _cmd_msg_add(self, msg: dict) -> dict:
@@ -264,17 +306,14 @@ class Daemon:
             return {"error": "element must be a JSON object"}
         if "type" not in elem:
             return {"error": "element must have a 'type' field (cw, voice, tone)"}
-        if name not in self.cfg.messages:
-            self.cfg.messages[name] = []
-        self.cfg.messages[name].append(elem)
-        log.info("Element added to '%s': %r", name, elem)
+        port = self._get_port(msg)
+        if not port:
+            return {"error": "no port running"}
+        if name not in port.cfg.messages:
+            port.cfg.messages[name] = []
+        port.cfg.messages[name].append(elem)
+        log.info("[%s] Element added to '%s': %r", port.name, name, elem)
         return {}
-
-    # ── state-change → push event ─────────────────────────────────────────────
-
-    def _on_port_state_change(self, status: dict) -> None:
-        if self._api:
-            self._api.push_event({"event": "status", **status})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,7 +337,6 @@ def main() -> None:
     else:
         cfg = RepeaterConfig()
 
-    # Resolve relative socket path before logging so the log line is accurate
     cfg.daemon.socket_path = _resolve_socket_path(cfg.daemon.socket_path, config_path)
 
     logging.basicConfig(
@@ -321,8 +359,6 @@ def main() -> None:
             log.info("Shutdown signal received")
             task.cancel()
 
-        # Register inside the event loop so handlers fire safely on the loop thread,
-        # avoiding lock contention with logging and asyncio internals.
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGINT,  _request_shutdown)
         loop.add_signal_handler(signal.SIGTERM, _request_shutdown)

@@ -3,13 +3,18 @@
 socket_path = "run/rc.sock"    # relative to this config file's directory
 log_level = "INFO"
 
-[hardware]
+# Each [[port]] section defines one repeater port.
+# Add additional [[port]] sections for multi-port operation.
+[[port]]
+name = "main"
+
+[port.hardware]
 hidraw_device    = ""                     # leave empty for auto-detect by USB VID 0x0d8c
 audio_device     = "USB PnP Sound Device" # must be the same device for duplex RX+TX
 cor_active_low   = true   # true = bit clear means COR active (AllStar/chan_usbradio convention)
 ctcss_active_low = true   # true = bit clear means CTCSS active
 
-[audio]
+[port.audio]
 sample_rate         = 48000
 rx_hpf              = true    # 300 Hz high-pass on RX (removes CTCSS/hum)
 rx_deemphasis       = true    # FM de-emphasis on RX audio
@@ -25,10 +30,10 @@ pre_message_ms      = 0       # ms dead air after PTT-on before CW/voice starts 
 post_message_ms     = 0       # ms dead air after audio drains before PTT-off (0 = none)
 ste_delay_ms        = 0       # squelch tail elimination delay in ms (0 = disabled)
 
-[ctcss]
+[port.ctcss]
 access_mode = "cor"   # "cor" (COR alone) or "cor_ctcss" (both required)
 
-[timers]
+[port.timers]
 hang        = 2.5     # s — hang time: PTT holdoff after CT ("hangup time")
 ct_delay    = 0.5     # s — delay from RX stream loss to courtesy tone
 kerchunk    = 0.5     # s — minimum COR hold to respond (anti-kerchunk)
@@ -36,7 +41,7 @@ timeout     = 180.0   # s — time-out timer (TOT) transmit cutoff
 id_interval = 600.0   # s — mandatory ID interval (FCC ≤ 10 min)
 id_pending  = 60.0    # s — sneak pending ID this far before the mandatory deadline
 
-[identity]
+[port.identity]
 startup_message        = ""              # message played at daemon start; leave empty for none
 initial_ids            = ["default_voice"]
 mandatory_ids          = ["default_cw"]
@@ -46,10 +51,10 @@ ct_message             = "yellow_jacket"
 timeout_message        = "timeout_warn"
 timeout_cancel_message = ""              # played when TX resumes after a timeout; leave empty for none
 
-[messages.default_cw]
+[port.messages.default_cw]
 elements = [{type = "cw", text = "W0ABC/R"}]
 
-[messages.timeout_warn]
+[port.messages.timeout_warn]
 elements = [
   {type = "tone", freq1 = 1200, freq2 = 0, ms = 60, amp = 0.9},
   {type = "tone", freq1 = 0,    freq2 = 0, ms = 20, amp = 0.0},
@@ -58,7 +63,7 @@ elements = [
   {type = "tone", freq1 = 800,  freq2 = 0, ms = 60, amp = 0.9},
 ]
 
-[messages.default_voice]
+[port.messages.default_voice]
 elements = [
   {type = "voice", clip = "THIS"},
   {type = "voice", clip = "IS"},
@@ -70,26 +75,26 @@ elements = [
   {type = "voice", clip = "REPEATER"},
 ]
 
-[messages.yellow_jacket]
+[port.messages.yellow_jacket]
 elements = [
   {type = "tone", freq1 = 330.0, freq2 = 0.0, ms = 50, amp = 0.7},
   {type = "tone", freq1 = 495.0, freq2 = 0.0, ms = 50, amp = 0.7},
   {type = "tone", freq1 = 660.0, freq2 = 0.0, ms = 50, amp = 0.7},
 ]
 
-[messages.bumble_bee]
+[port.messages.bumble_bee]
 elements = [
   {type = "tone", freq1 = 330.0, freq2 = 0.0, ms = 100, amp = 0.7},
   {type = "tone", freq1 = 495.0, freq2 = 0.0, ms = 100, amp = 0.7},
   {type = "tone", freq1 = 660.0, freq2 = 0.0, ms = 100, amp = 0.7},
 ]
 
-[messages.shooting_star]
+[port.messages.shooting_star]
 elements = [
   {type = "tone", freq1 = 800.0, freq2 = 0.0, ms = 100, amp = 0.7},
   {type = "tone", freq1 = 800.0, freq2 = 0.0, ms = 100, amp = 0.7},
   {type = "tone", freq1 = 540.0, freq2 = 0.0, ms = 100, amp = 0.7},
 ]
 
-[messages.piano_chord]
+[port.messages.piano_chord]
 elements = [{type = "tone", freq1 = 660.0, freq2 = 880.0, ms = 100, amp = 0.7}]
