@@ -158,15 +158,23 @@ cp repeater.toml.sample repeater.toml
 Key sections:
 
 ```toml
-[hardware]
-cor_active_low   = true   # true = bit clear means COR active (AllStar convention)
-ctcss_active_low = true   # true = bit clear means CTCSS active
-
-[ctcss]
+[ports.main]
 access_mode = "cor"       # "cor" = COR alone opens repeater
                           # "cor_ctcss" = both COR and CTCSS required
 
-[audio]
+[ports.main.hardware]
+hidraw_device    = ""                     # "" = auto-detect; "usb:1-1.2" = by physical USB port
+                                          # Run: python daemon.py --list-devices  to find port IDs.
+                                          # Use usb: form for multi-port installs to prevent
+                                          # mis-assignment if adapters enumerate in a different order.
+audio_device     = "USB PnP Sound Device" # DO NOT CHANGE — this is the exact name the CM119
+                                          # registers with the OS. sounddevice uses it to open
+                                          # the correct audio interface. Changing it will prevent
+                                          # the daemon from starting.
+cor_active_low   = true   # true = bit clear means COR active (AllStar convention)
+ctcss_active_low = true   # true = bit clear means CTCSS active
+
+[ports.main.audio]
 rx_hpf               = true   # 300 Hz HPF removes sub-audible energy from RX
 rx_deemphasis        = true   # FM de-emphasis on received audio
 tx_preemphasis       = false  # FM pre-emphasis on transmitted audio
@@ -178,7 +186,7 @@ pre_message_ms       = 0      # dead air after PTT-on before CW/voice starts
 post_message_ms      = 0      # dead air after audio drains before PTT-off
 ste_delay_ms         = 0      # squelch tail elimination delay (0 = disabled)
 
-[timers]
+[ports.main.timers]
 hang        = 2.5    # s — hang time: PTT holdoff after CT ("hangup time")
 ct_delay    = 0.5    # s — delay from RX stream loss to courtesy tone
 kerchunk    = 0.5    # s — minimum COR hold to respond
@@ -186,7 +194,7 @@ timeout     = 180.0  # s — TOT cutoff
 id_interval = 600.0  # s — FCC ID interval (≤ 10 min)
 id_pending  = 60.0   # s — arm pending ID this far before mandatory deadline
 
-[identity]
+[ports.main.events]
 startup_message        = ""              # message played at daemon start
 initial_ids            = ["default_voice"]   # rotation; played at end of first hang
 mandatory_ids          = ["default_cw"]      # rotation; played when ID interval expires

@@ -32,11 +32,53 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import re
 import select
 import threading
 from typing import Callable
 
 log = logging.getLogger("hardware")
+
+
+def _usb_topology(hidraw_name: str) -> str | None:
+    """Return the USB port topology string (e.g. '1-1.2') for a hidraw device.
+
+    Extracted from the sysfs symlink target, which encodes the physical port
+    path.  This string is stable across reboots as long as the cable stays in
+    the same USB socket.
+    """
+    try:
+        link = os.readlink(f'/sys/class/hidraw/{hidraw_name}')
+        topology = None
+        for part in link.split('/'):
+            if re.match(r'^\d+-[\d.]+$', part):
+                topology = part   # keep iterating — last match is most specific
+        return topology
+    except Exception:
+        return None
+
+
+def list_devices() -> list[dict]:
+    """Return info for every connected CM119-compatible hidraw device.
+
+    Each entry has 'hidraw' (e.g. '/dev/hidraw0') and 'usb_port' (e.g. '1-1.2').
+    usb_port can be used as 'usb:<port>' in hidraw_device config to pin a port
+    to a specific physical USB socket.
+    """
+    vid_hex = f"{CM119Hardware.VID:08X}"
+    results = []
+    for uevent_path in sorted(glob.glob('/sys/class/hidraw/*/device/uevent')):
+        try:
+            if vid_hex not in open(uevent_path).read().upper():
+                continue
+            hidraw_name = uevent_path.split('/')[4]
+            results.append({
+                'hidraw':    f'/dev/{hidraw_name}',
+                'usb_port':  _usb_topology(hidraw_name) or '(unknown)',
+            })
+        except Exception:
+            continue
+    return results
 
 
 class CM119Hardware:
@@ -82,7 +124,7 @@ class CM119Hardware:
 
     def open(self) -> None:
         """Open the hidraw device and start the background reader thread."""
-        path = self._path or self._autodetect()
+        path = self._resolve_path()
         if path is None:
             raise RuntimeError(
                 f"No CM119-compatible HID device found (VID 0x{self.VID:04x}).  "
@@ -153,14 +195,42 @@ class CM119Hardware:
 
     # ── internal ───────────────────────────────────────────────────────────────
 
+    def _resolve_path(self) -> str | None:
+        """Resolve self._path to an actual /dev/hidrawN path."""
+        if not self._path:
+            return self._autodetect()
+        if self._path.startswith('usb:'):
+            topology = self._path[4:]
+            path = self._resolve_usb_topology(topology)
+            if path is None:
+                raise RuntimeError(
+                    f"No CM119 device found at USB port '{topology}'.  "
+                    "Run 'python daemon.py --list-devices' to see connected devices."
+                )
+            return path
+        return self._path
+
     def _autodetect(self) -> str | None:
-        """Find the CM119 hidraw device via sysfs uevent files."""
+        """Find the first CM119 hidraw device via sysfs uevent files."""
         vid_hex = f"{self.VID:08X}"
         for uevent_path in glob.glob('/sys/class/hidraw/*/device/uevent'):
             try:
-                content = open(uevent_path).read()
-                if vid_hex in content.upper():
+                if vid_hex in open(uevent_path).read().upper():
                     hidraw_name = uevent_path.split('/')[4]   # 'hidraw0', 'hidraw1', …
+                    return f'/dev/{hidraw_name}'
+            except Exception:
+                continue
+        return None
+
+    def _resolve_usb_topology(self, topology: str) -> str | None:
+        """Find the hidraw path for a device at the given USB port topology."""
+        vid_hex = f"{self.VID:08X}"
+        for uevent_path in glob.glob('/sys/class/hidraw/*/device/uevent'):
+            try:
+                if vid_hex not in open(uevent_path).read().upper():
+                    continue
+                hidraw_name = uevent_path.split('/')[4]
+                if _usb_topology(hidraw_name) == topology:
                     return f'/dev/{hidraw_name}'
             except Exception:
                 continue

@@ -568,7 +568,6 @@ class Port:
                 log.error("CW element has no 'text': %r", elem)
                 return
             ac = self.cfg.audio
-            log.info("CW: '%s'  %d WPM  %d Hz", text, ac.morse_wpm, ac.morse_pitch)
             samples = morse.render(text, ac.morse_wpm, ac.morse_pitch, ac.morse_level, sr)
             if samples.size > 0:
                 self._engine.play_samples(samples, label=f"cw:{text}")
@@ -588,7 +587,6 @@ class Port:
             level = self.cfg.audio.voice_level
             if level != 1.0:
                 samples = samples * level
-            log.info("VOICE: '%s'  level=%.0f%%", clip_name, level * 100)
             self._engine.play_samples(
                 samples, label=f"voice:{clip_name}", blocks_passthrough=True
             )

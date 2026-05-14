@@ -68,32 +68,38 @@ class Daemon:
         self._loop = asyncio.get_running_loop()
 
         for pc in self.cfg.ports:
-            hw = CM119Hardware(
-                pc.hardware.hidraw_device,
-                cor_active_low   = pc.hardware.cor_active_low,
-                ctcss_active_low = pc.hardware.ctcss_active_low,
-            )
-            hw.open()
-            log.info("[%s] CM119 opened — hidraw: %s",
-                     pc.name, pc.hardware.hidraw_device or "(auto)")
+            try:
+                hw = CM119Hardware(
+                    pc.hardware.hidraw_device,
+                    cor_active_low   = pc.hardware.cor_active_low,
+                    ctcss_active_low = pc.hardware.ctcss_active_low,
+                )
+                hw.open()
+                log.info("[%s] CM119 opened — hidraw: %s",
+                         pc.name, pc.hardware.hidraw_device or "(auto)")
 
-            ac        = pc.audio
-            audio_dev = pc.hardware.audio_device or None
-            engine    = AudioEngine(
-                sample_rate         = ac.sample_rate,
-                blocksize           = ac.sample_rate // 50,   # 20 ms
-                input_device        = audio_dev,
-                output_device       = audio_dev,
-                rx_hpf              = ac.rx_hpf,
-                rx_deemphasis       = ac.rx_deemphasis,
-                tx_preemphasis      = ac.tx_preemphasis,
-                repeat_gain         = ac.repeat_gain,
-                voice_blocks_repeat = ac.voice_blocks_repeat,
-                ste_delay_ms        = ac.ste_delay_ms,
-            )
-            engine.start()
+                ac        = pc.audio
+                audio_dev = pc.hardware.audio_device or None
+                engine    = AudioEngine(
+                    sample_rate         = ac.sample_rate,
+                    blocksize           = ac.sample_rate // 50,   # 20 ms
+                    input_device        = audio_dev,
+                    output_device       = audio_dev,
+                    rx_hpf              = ac.rx_hpf,
+                    rx_deemphasis       = ac.rx_deemphasis,
+                    tx_preemphasis      = ac.tx_preemphasis,
+                    repeat_gain         = ac.repeat_gain,
+                    voice_blocks_repeat = ac.voice_blocks_repeat,
+                    ste_delay_ms        = ac.ste_delay_ms,
+                )
+                engine.start()
+            except Exception as exc:
+                log.critical("[%s] Hardware init failed — %s", pc.name, exc)
+                log.critical("Shutting down: fix config or check connections and restart.")
+                self._shutdown_event.set()
+                return
 
-            port = Port(pc, hw, engine, cfg.messages)
+            port = Port(pc, hw, engine, self.cfg.messages)
             port.add_state_listener(self._make_state_listener(pc.name))
             port.start(self._loop)
             self._ports.append(port)
@@ -319,7 +325,27 @@ def _resolve_socket_path(socket_path: str, config_path: str | None) -> str:
     return str(base / p)
 
 
+def _cmd_list_devices() -> None:
+    from hardware import list_devices
+    devices = list_devices()
+    if not devices:
+        print("No CM119-compatible devices found.")
+        return
+    print(f"{'DEVICE':<16}  USB PORT")
+    print(f"{'------':<16}  --------")
+    for d in devices:
+        print(f"{d['hidraw']:<16}  {d['usb_port']}")
+    print()
+    print("To pin a port to a physical USB socket, set in config:")
+    print('  hidraw_device = "usb:<USB PORT>"')
+    print("e.g.  hidraw_device = \"usb:1-1.2\"")
+
+
 def main() -> None:
+    if '--list-devices' in sys.argv:
+        _cmd_list_devices()
+        return
+
     config_path = sys.argv[1] if len(sys.argv) > 1 else None
 
     if config_path:
