@@ -452,6 +452,10 @@ class Port:
         mandatory ID had just fired, then hands off to the normal CT delay.
         """
         epoch = self._id_epoch
+        # Give the unkeying station's radio time to switch from TX to RX.
+        pre_s = self.cfg.audio.pre_message_ms / 1000.0
+        if pre_s > 0:
+            await asyncio.sleep(pre_s)
         name = self.cfg.events.pending_id
         if name:
             self._voice_id_active = self._message_has_voice(name)
@@ -477,6 +481,10 @@ class Port:
         we ensure the ID timer is running and bail without scheduling a CT delay.
         """
         epoch = self._id_epoch
+        # Give the unkeying station's radio time to switch from TX to RX.
+        pre_s = self.cfg.audio.pre_message_ms / 1000.0
+        if pre_s > 0:
+            await asyncio.sleep(pre_s)
         await self._transmit_id("initial")   # PTT already on; just queues audio
         await self._drain_clips()
         self._voice_id_active = False
