@@ -116,7 +116,7 @@ Key sections:
 **ID system** (port.py):
 - Boots in *quiet period* (`_id_timer is None`); timer starts after first TX
 - `_tx_activity` flag — True when TX has been used since last ID; checked at timer expiry
-- *Initial ID* — at end of hang following first TX from quiet period; waits politely for QSO to end
+- *Initial ID* — at COR drop following first TX from quiet period (start of tail, before CT); for startup message it fires inline immediately after the startup audio
 - *Mandatory ID* — timer expires with activity, state not ACTIVE
 - *Pending ID* — sneaked in at COR drop (before CT) when `_pending_id_armed` is set by the `id_pending` sub-timer
 - *Impolite ID* — plays over active QSO when mandatory deadline hits mid-transmission; uses `impolite_morse_level` for CW ducking; does not reset `_tx_activity` (QSO is still ongoing)

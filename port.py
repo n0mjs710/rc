@@ -86,7 +86,7 @@ class Port:
         self._id_rot: dict[str, int] = {"initial": 0, "mandatory": 0}
         self._last_id_time:       float = 0.0
         self._tx_activity:        bool  = False  # TX occurred since last ID
-        self._initial_id_pending: bool  = False  # initial ID queued for end of hang
+        self._initial_id_pending: bool  = False  # initial ID queued for COR drop (start of tail)
         self._pending_id_armed:   bool  = False  # pending-ID window is open
         self._voice_id_active:    bool  = False  # voice-element ID currently playing
         self._impolite_id_playing: bool = False  # impolite ID in progress; suppresses CT queueing
@@ -110,8 +110,8 @@ class Port:
         self._hw.add_cor_callback(self._on_cor_edge)
         self._hw.add_ctcss_callback(self._on_ctcss_edge)
         # Boot in quiet period — no ID timer until after the first initial ID fires.
-        # The initial ID fires at end of hang: startup hang if there is a startup
-        # message, otherwise the first user transmission's hang.
+        # For startup the initial ID plays inline after the startup message.
+        # For the first user TX it fires at COR drop (start of tail).
         if self.cfg.events.startup_message:
             loop.create_task(self._play_startup())
         log.info("[%s] Port started — state=IDLE  access=%s",
@@ -200,6 +200,9 @@ class Port:
                 self._transition(State.TAIL)
                 if self._pending_id_armed:
                     self._loop.create_task(self._do_pending_id())
+                elif self._initial_id_pending:
+                    self._initial_id_pending = False
+                    self._loop.create_task(self._do_initial_id())
                 elif not self._impolite_id_playing:
                     # Suppress CT delay while impolite ID is playing; it will
                     # fire one CT itself after the audio drains.
@@ -256,6 +259,9 @@ class Port:
             self._transition(State.TAIL)
             if self._pending_id_armed:
                 self._loop.create_task(self._do_pending_id())
+            elif self._initial_id_pending:
+                self._initial_id_pending = False
+                self._loop.create_task(self._do_initial_id())
             elif not self._impolite_id_playing:
                 self._schedule_ct_delay()
         elif self.state == State.PENDING:
@@ -317,10 +323,6 @@ class Port:
         self._hang_timer = None
         if self._cor:
             return   # COR went active during hang; state machine will handle it
-        if self._initial_id_pending:
-            self._initial_id_pending = False
-            self._loop.create_task(self._do_initial_id())
-            return   # PTT stays on; _do_initial_id drops it and transitions to IDLE
         self._set_ptt(False)
         self._transition(State.IDLE)
 
@@ -465,49 +467,62 @@ class Port:
             self._schedule_ct_delay()
 
     async def _do_initial_id(self) -> None:
-        """Play initial ID at end of hang, start ID timer, then go IDLE.
+        """Play initial ID at COR drop (start of tail), reset ID cycle, hand to CT delay.
 
-        Called from _on_hang() when _initial_id_pending was set.  PTT is
-        already on; we play the ID, wait for audio to drain, then drop PTT
-        and transition to IDLE.  If COR goes active during the drain the
-        state machine takes over (state becomes ACTIVE) and we leave PTT alone.
+        Called from _cor_idle() / _ctcss_idle() when _initial_id_pending is set.
+        PTT is already on (repeater is in TAIL).  Queues audio, drains, resets
+        the ID cycle, then hands off to the normal CT-delay → hang → IDLE path.
+        If COR goes active during the drain the epoch changes (via impolite-ID
+        for voice IDs) or is detected below (for CW-only IDs); in either case
+        we ensure the ID timer is running and bail without scheduling a CT delay.
         """
         epoch = self._id_epoch
-        await self._transmit_id("initial")   # PTT on; just queues audio
+        await self._transmit_id("initial")   # PTT already on; just queues audio
         await self._drain_clips()
         self._voice_id_active = False
         if self._id_epoch != epoch:
+            # Interrupted (COR came back during a voice ID → impolite path took over).
+            if self._id_timer is None:
+                self._schedule_id()
             return
         self._last_id_time = self._loop.time()
-        if not self._id_timer:
-            self._schedule_id()
         if self.state != State.ACTIVE:
             self._tx_activity = False
-            if not self._cor:
-                self._set_ptt(False)
-                self._transition(State.IDLE)
+        if not self._id_timer:
+            self._schedule_id()
+        if self.state == State.TAIL and not self._cor:
+            self._schedule_ct_delay()
 
     async def _play_startup(self) -> None:
-        """Key TX at boot and play the startup message.
+        """Key TX at boot, play the startup message, then identify and go IDLE.
 
-        The initial ID fires naturally at end of the hang that follows,
-        via the same _on_hang() → _do_initial_id() path as any first
-        user transmission from quiet period.  No CT is played — CTs are
-        user-facing signals that aren't meaningful for system transmissions.
+        The initial ID plays immediately after the startup audio — there is no
+        COR drop to trigger it, so we handle it inline here.  No CT is played
+        (CTs are user-facing QSO signals, not meaningful for system transmissions).
         """
         msg = self.cfg.events.startup_message
         if msg not in self._messages:
             log.warning("Startup message '%s' not found in config", msg)
             return
         log.info("Startup message → '%s'", msg)
-        self._note_tx_start()
         self._set_ptt(True)
         pre_s = self.cfg.audio.pre_message_ms / 1000.0
         if pre_s > 0 and self._message_needs_padding(msg):
             await asyncio.sleep(pre_s)
         self._play_message(msg)
         await self._drain_clips()
-        self._schedule_hang()
+        # Identify immediately after startup — PTT is on so _transmit_id just queues.
+        await self._transmit_id("initial")
+        await self._drain_clips()
+        self._voice_id_active = False
+        self._last_id_time = self._loop.time()
+        self._tx_activity = False
+        self._schedule_id()
+        post_s = self.cfg.audio.post_message_ms / 1000.0
+        if post_s > 0:
+            await asyncio.sleep(post_s)
+        self._set_ptt(False)
+        self._transition(State.IDLE)
 
     async def _transmit_id(self, id_type: str) -> None:
         if id_type == "initial":
@@ -684,20 +699,12 @@ class Port:
         if new_state == State.ACTIVE:
             self._tx_activity = True
             if old in (State.IDLE, State.PENDING) and self._id_timer is None:
-                # First TX from quiet period — queue initial ID for end of hang.
+                # First TX from quiet period — initial ID fires at next COR drop.
                 self._initial_id_pending = True
-            elif old == State.TAIL and self._initial_id_pending:
-                # COR came back during hang before the initial ID fired — cancel
-                # it and start the mandatory-ID timer instead (two transmissions
-                # without an ID, so the clock needs to run).
-                self._initial_id_pending = False
-                if self._id_timer is None:
-                    self._schedule_id()
             # If a voice-element ID is currently playing, interrupt it.
             # CW/tone IDs are readable over voice, so only voice IDs are cancelled.
             if self._voice_id_active and self._engine.is_playing():
-                # The impolite ID takes over the ID cycle — cancel any pending
-                # initial ID flag so _on_hang() doesn't fire a second voice ID.
+                # Impolite ID takes over; discard any queued initial ID.
                 self._initial_id_pending = False
                 self._id_epoch += 1
                 self._voice_id_active = False
