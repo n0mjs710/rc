@@ -34,8 +34,6 @@ from audio_engine import AudioEngine, VocabCache
 from tones import render_tone
 import morse
 
-log = logging.getLogger("port")
-
 
 class State(Enum):
     IDLE    = auto()
@@ -58,6 +56,7 @@ class Port:
                  engine: AudioEngine, messages: dict) -> None:
         self.cfg      = cfg
         self.name     = cfg.name
+        self.log      = logging.getLogger(f"port.{self.name}")
         self._hw      = hw
         self._engine  = engine
         self._messages = messages
@@ -71,7 +70,7 @@ class Port:
             VocabCache(voice_dirs, cfg.audio.sample_rate) if voice_dirs else None
         )
         if not voice_dirs:
-            log.warning("No voice directories found — VOICE elements will be skipped")
+            self.log.warning("No voice directories found — VOICE elements will be skipped")
 
         # Signal presence flags
         self._cor:   bool  = False
@@ -114,8 +113,7 @@ class Port:
         # For the first user TX it fires at COR drop (start of tail).
         if self.cfg.events.startup_message:
             loop.create_task(self._play_startup())
-        log.info("[%s] Port started — state=IDLE  access=%s",
-                 self.name, self.cfg.access_mode)
+        self.log.info("Port started — state=IDLE  access=%s", self.cfg.access_mode)
 
     def stop(self) -> None:
         self._hw.remove_cor_callback(self._on_cor_edge)
@@ -123,7 +121,7 @@ class Port:
         for name in ("hang", "ct_delay", "timeout", "ctcss", "id", "id_sub"):
             self._cancel(name)
         self._set_ptt(False)
-        log.info("[%s] Port stopped.", self.name)
+        self.log.info("Port stopped.")
 
     # ── hardware edge callbacks (called from HID reader thread) ───────────────
 
@@ -151,7 +149,7 @@ class Port:
         self._cancel("hang")
         self._cancel("ct_delay")
         am = self.cfg.access_mode
-        log.info("COR ACTIVE  state=%s  access=%s", self.state.name, am)
+        self.log.info("COR ACTIVE  state=%s  access=%s", self.state.name, am)
 
         if am == "cor":
             if self.state in (State.IDLE, State.TAIL):
@@ -177,7 +175,7 @@ class Port:
         self._cor = False
         self._cancel("ctcss")
         duration = self._loop.time() - self._cor_up_time
-        log.info("COR IDLE  held=%.2fs  state=%s", duration, self.state.name)
+        self.log.info("COR IDLE  held=%.2fs  state=%s", duration, self.state.name)
 
         if self.state == State.PENDING:
             self._cancel("timeout")
@@ -185,7 +183,7 @@ class Port:
 
         elif self.state in (State.ACTIVE, State.TAIL):
             if self.state == State.ACTIVE and duration < self.cfg.timers.kerchunk:
-                log.info("Kerchunk suppressed (%.2fs < %.2fs)",
+                self.log.info("Kerchunk suppressed (%.2fs < %.2fs)",
                          duration, self.cfg.timers.kerchunk)
                 self._cancel("timeout")
                 self._tot_used = 0.0
@@ -212,7 +210,7 @@ class Port:
             # Offending transmission ended; TX comes back up for cancel msg + hang,
             # just like the end of a normal QSO (minus ct_delay — the cancel msg
             # serves that purpose).
-            log.info("COR idle after timeout — TX resuming for cancel message and hang")
+            self.log.info("COR idle after timeout — TX resuming for cancel message and hang")
             self._set_ptt(True)
             self._transition(State.TAIL)
             self._loop.create_task(self._do_timeout_recovery())
@@ -230,7 +228,7 @@ class Port:
     async def _ctcss_active(self) -> None:
         self._ctcss = True
         am = self.cfg.access_mode
-        log.info("CTCSS ACTIVE  state=%s  access=%s", self.state.name, am)
+        self.log.info("CTCSS ACTIVE  state=%s  access=%s", self.state.name, am)
 
         if am == "cor_ctcss":
             if self.state == State.PENDING and self._cor:
@@ -252,10 +250,10 @@ class Port:
     async def _ctcss_idle(self) -> None:
         self._ctcss = False
         am = self.cfg.access_mode
-        log.info("CTCSS IDLE  state=%s", self.state.name)
+        self.log.info("CTCSS IDLE  state=%s", self.state.name)
 
         if am == "cor_ctcss" and self.state == State.ACTIVE:
-            log.info("CTCSS idle in cor_ctcss mode → tail")
+            self.log.info("CTCSS idle in cor_ctcss mode → tail")
             self._transition(State.TAIL)
             if self._pending_id_armed:
                 self._loop.create_task(self._do_pending_id())
@@ -311,7 +309,7 @@ class Port:
             return
         name = self.cfg.events.ct_message
         if name:
-            log.info("CT delay — playing '%s'", name)
+            self.log.info("CT delay — playing '%s'", name)
             self._play_message(name)
         # CT marks the end of a QSO session: reset the accumulated TOT so the
         # next operator starts with a clean timer.  TOT was already paused
@@ -328,7 +326,7 @@ class Port:
 
     def _on_timeout(self) -> None:
         self._timeout_timer = None
-        log.warning("TOT — locking out repeater")
+        self.log.warning("TOT — locking out repeater")
         # Transition first so _update_passthrough sees TIMEOUT and closes the gate.
         self._transition(State.TIMEOUT)
         self._update_passthrough()
@@ -341,12 +339,12 @@ class Port:
         self._ctcss_timer = None
         if self.state == State.PENDING:
             missing = "COR" if self._ctcss else "CTCSS"
-            log.warning("PENDING timeout — %s not received — back to IDLE", missing)
+            self.log.warning("PENDING timeout — %s not received — back to IDLE", missing)
             self._transition(State.IDLE)
 
     def _on_id_sub(self) -> None:
         self._id_sub_timer = None
-        log.debug("Pending ID window open — will ID at next COR drop")
+        self.log.debug("Pending ID window open — will ID at next COR drop")
         self._pending_id_armed = True
 
     def _on_id(self) -> None:
@@ -357,13 +355,13 @@ class Port:
         if self.state == State.ACTIVE:
             self._tx_activity = True
         if not self._tx_activity:
-            log.info("ID interval expired — no TX activity, entering quiet period")
+            self.log.info("ID interval expired — no TX activity, entering quiet period")
             return
         if self.state == State.ACTIVE:
-            log.warning("ID required over active QSO — transmitting impolite ID")
+            self.log.warning("ID required over active QSO — transmitting impolite ID")
             self._loop.create_task(self._do_impolite_id())
         else:
-            log.info("Mandatory ID timer fired")
+            self.log.info("Mandatory ID timer fired")
             self._loop.create_task(self._do_mandatory_id())
 
     # ── async audio helpers ────────────────────────────────────────────────────
@@ -415,7 +413,7 @@ class Port:
         if not name:
             rotation = list(self.cfg.events.mandatory_ids)
             if not rotation:
-                log.warning("No impolite or mandatory ID configured")
+                self.log.warning("No impolite or mandatory ID configured")
                 self._last_id_time = self._loop.time()
                 self._schedule_id()
                 return
@@ -423,7 +421,7 @@ class Port:
             name = rotation[idx]
             self._id_rot["mandatory"] = (idx + 1) % len(rotation)
 
-        log.info("Impolite ID → '%s'", name)
+        self.log.info("Impolite ID → '%s'", name)
         self._impolite_id_playing = True
         saved = self.cfg.audio.morse_level
         self.cfg.audio.morse_level = self.cfg.audio.impolite_morse_level
@@ -510,9 +508,9 @@ class Port:
         """
         msg = self.cfg.events.startup_message
         if msg not in self._messages:
-            log.warning("Startup message '%s' not found in config", msg)
+            self.log.warning("Startup message '%s' not found in config", msg)
             return
-        log.info("Startup message → '%s'", msg)
+        self.log.info("Startup message → '%s'", msg)
         self._set_ptt(True)
         pre_s = self.cfg.audio.pre_message_ms / 1000.0
         if pre_s > 0 and self._message_needs_padding(msg):
@@ -539,13 +537,13 @@ class Port:
             rotation = list(self.cfg.events.mandatory_ids)
 
         if not rotation:
-            log.warning("No %s ID messages configured", id_type)
+            self.log.warning("No %s ID messages configured", id_type)
             return
 
         idx      = self._id_rot.get(id_type, 0) % len(rotation)
         msg_name = rotation[idx]
         self._id_rot[id_type] = (idx + 1) % len(rotation)
-        log.info("ID (%s) → '%s'", id_type, msg_name)
+        self.log.info("ID (%s) → '%s'", id_type, msg_name)
 
         self._voice_id_active = self._message_has_voice(msg_name)
 
@@ -573,10 +571,10 @@ class Port:
     def _play_message(self, name: str) -> None:
         elements = self._messages.get(name)
         if elements is None:
-            log.error("Message '%s' not found in config", name)
+            self.log.error("Message '%s' not found in config", name)
             return
         if not elements:
-            log.warning("Message '%s' has no elements", name)
+            self.log.warning("Message '%s' has no elements", name)
             return
         for elem in elements:
             self._play_element(elem)
@@ -588,7 +586,7 @@ class Port:
         if etype == "cw":
             text = elem.get("text", "")
             if not text:
-                log.error("CW element has no 'text': %r", elem)
+                self.log.error("CW element has no 'text': %r", elem)
                 return
             ac = self.cfg.audio
             samples = morse.render(text, ac.morse_wpm, ac.morse_pitch, ac.morse_level, sr)
@@ -598,14 +596,14 @@ class Port:
         elif etype == "voice":
             clip_name = elem.get("clip", "")
             if not clip_name:
-                log.error("VOICE element has no 'clip': %r", elem)
+                self.log.error("VOICE element has no 'clip': %r", elem)
                 return
             if not self._vocab:
-                log.error("No voice directories — cannot play '%s'", clip_name)
+                self.log.error("No voice directories — cannot play '%s'", clip_name)
                 return
             samples = self._vocab.get(clip_name)
             if samples is None:
-                log.error("Voice clip '%s' not found", clip_name)
+                self.log.error("Voice clip '%s' not found", clip_name)
                 return
             level = self.cfg.audio.voice_level
             if level != 1.0:
@@ -623,10 +621,10 @@ class Port:
                 )
                 self._engine.play_samples(audio, label="tone:inline")
             else:
-                log.error("TONE element missing 'freq1': %r", elem)
+                self.log.error("TONE element missing 'freq1': %r", elem)
 
         else:
-            log.error("Unknown element type '%s': %r", etype, elem)
+            self.log.error("Unknown element type '%s': %r", etype, elem)
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
@@ -652,12 +650,12 @@ class Port:
     def _set_ptt(self, active: bool) -> None:
         self._hw.set_ptt(active)
         self._engine.set_ptt(active)
-        log.info("PTT %s", "ON" if active else "OFF")
+        self.log.info("PTT %s", "ON" if active else "OFF")
         self._notify_listeners()
 
     def _set_passthrough(self, active: bool) -> None:
         self._engine.set_passthrough(active)
-        log.debug("Passthrough %s", "ON" if active else "OFF")
+        self.log.debug("Passthrough %s", "ON" if active else "OFF")
 
     def _update_passthrough(self) -> None:
         """Gate the RX audio source on live hardware signal state.
@@ -681,7 +679,7 @@ class Port:
     def _transition(self, new_state: State) -> None:
         old = self.state
         self.state = new_state
-        log.info("State: %s → %s", old.name, new_state.name)
+        self.log.info("State: %s → %s", old.name, new_state.name)
 
         # TOT management: accumulates only while ACTIVE; pauses on unkey; resets at CT.
         # Timeout can only fire while the qualified signal is present — it never fires
@@ -694,12 +692,12 @@ class Port:
                 max(0.0, self.cfg.timers.timeout - self._tot_used),
                 self._on_timeout,
             )
-            log.debug("TOT resumed — %.1fs used, %.1fs remaining",
+            self.log.debug("TOT resumed — %.1fs used, %.1fs remaining",
                       self._tot_used, self.cfg.timers.timeout - self._tot_used)
         elif old == State.ACTIVE and new_state == State.TAIL:
             self._tot_used += self._loop.time() - self._tot_start
             self._cancel("timeout")
-            log.debug("TOT paused — %.1fs accumulated", self._tot_used)
+            self.log.debug("TOT paused — %.1fs accumulated", self._tot_used)
         elif new_state == State.TIMEOUT:
             self._tot_used = 0.0   # clean slate for post-timeout recovery
 
@@ -736,7 +734,7 @@ class Port:
             try:
                 cb(snapshot)
             except Exception as exc:
-                log.error("State listener error: %s", exc)
+                self.log.error("State listener error: %s", exc)
 
     def get_status(self) -> dict:
         """Return a snapshot of current port state (safe to call from any thread)."""
