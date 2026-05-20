@@ -307,9 +307,6 @@ class AudioEngine:
                   time_info,
                   status) -> None:
 
-        if status:
-            log.warning("Audio status: %s", status)
-
         with self._ptt_lock:
             ptt = self._ptt
 
@@ -317,6 +314,10 @@ class AudioEngine:
         if not ptt:
             outdata[:] = 0
             return
+
+        # Overflows/underflows during an active transmission are real problems.
+        if status:
+            log.warning("Audio status: %s", status)
 
         # ── RX path (only while PTT is active) ───────────────────────────────
         rx = indata[:, 0].copy()
