@@ -78,8 +78,8 @@ Key sections:
 - `[hardware]` — hidraw_device (empty = auto-detect), audio_device, cor_active_low, ctcss_active_low
 - `[audio]` — sample_rate (48000 — CM119 only supports 44100/48000), rx_hpf, rx_deemphasis, tx_preemphasis, repeat_gain, morse_wpm, morse_pitch, morse_level, impolite_morse_level, voice_level, voice_blocks_repeat, pre_message_ms, post_message_ms, ste_delay_ms
 - `[ctcss]` — access_mode ("cor" or "cor_ctcss")
-- `[timers]` — hang (PTT holdoff/"hangup time"), ct_delay (pre-CT pause), kerchunk, timeout, id_interval, id_pending
-- `[identity]` — startup_message, initial_ids (rotation list), mandatory_ids (rotation list), pending_id, impolite_id, ct_message, timeout_message, timeout_cancel_message
+- `[timers]` — hang (PTT holdoff/"hangup time"), ct_delay (pre-CT pause), kerchunk, timeout, id_interval, id_anxious
+- `[identity]` — startup_message, initial_ids (rotation list), mandatory_ids (rotation list), anxious_id, impolite_id, ct_message, timeout_message, timeout_cancel_message
 - `[messages]` — named sequences of cw/voice/tone elements
 
 ## Architecture
@@ -118,7 +118,7 @@ Key sections:
 - `_tx_activity` flag — True when TX has been used since last ID; checked at timer expiry
 - *Initial ID* — at COR drop following first TX from quiet period (start of tail, before CT); for startup message it fires inline immediately after the startup audio
 - *Mandatory ID* — timer expires with activity, state not ACTIVE
-- *Pending ID* — sneaked in at COR drop (before CT) when `_pending_id_armed` is set by the `id_pending` sub-timer
+- *Anxious ID* — sneaked in at COR drop (before CT) when `_anxious_id_armed` is set by the `id_anxious` sub-timer
 - *Impolite ID* — plays over active QSO when mandatory deadline hits mid-transmission; uses `impolite_morse_level` for CW ducking; does not reset `_tx_activity` (QSO is still ongoing)
 - *Epoch interruption* — `_id_epoch` counter; incremented when voice ID is interrupted by incoming COR; ID coroutines check epoch after each drain and bail if changed, so only one coroutine resets the ID cycle
 

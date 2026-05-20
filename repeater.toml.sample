@@ -39,13 +39,13 @@ ct_delay    = 0.5     # s — delay from RX stream loss to courtesy tone
 kerchunk    = 0.5     # s — minimum COR hold to respond (anti-kerchunk)
 timeout     = 180.0   # s — time-out timer (TOT) transmit cutoff
 id_interval = 600.0   # s — mandatory ID interval (FCC ≤ 10 min)
-id_pending  = 60.0    # s — sneak pending ID this far before the mandatory deadline
+id_anxious  = 60.0    # s — sneak anxious ID this far before the mandatory deadline
 
 [ports.main.events]
 startup_message        = ""              # message played at daemon start; leave empty for none
 initial_ids            = ["default_voice"]
 mandatory_ids          = ["default_cw"]
-pending_id             = ""              # snuck in at COR drop before mandatory deadline
+anxious_id             = ""              # sneaked in at COR drop before mandatory deadline
 impolite_id            = ""             # played over active QSO if mandatory deadline hits
 ct_message             = "yellow_jacket"
 timeout_message        = "timeout_warn"

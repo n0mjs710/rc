@@ -86,7 +86,7 @@ class Port:
         self._last_id_time:       float = 0.0
         self._tx_activity:        bool  = False  # TX occurred since last ID
         self._initial_id_pending: bool  = False  # initial ID queued for COR drop (start of tail)
-        self._pending_id_armed:   bool  = False  # pending-ID window is open
+        self._anxious_id_armed:   bool  = False  # anxious-ID window is open
         self._voice_id_active:    bool  = False  # voice-element ID currently playing
         self._impolite_id_playing: bool = False  # impolite ID in progress; suppresses CT queueing
         self._id_epoch:           int   = 0      # incremented to signal interrupted coroutines
@@ -97,7 +97,7 @@ class Port:
         self._timeout_timer:  asyncio.TimerHandle | None = None
         self._ctcss_timer:    asyncio.TimerHandle | None = None
         self._id_timer:       asyncio.TimerHandle | None = None
-        self._id_sub_timer:   asyncio.TimerHandle | None = None   # pending-ID window opener
+        self._id_sub_timer:   asyncio.TimerHandle | None = None   # anxious-ID window opener
 
         # State-change subscribers (for API push events)
         self._state_listeners: list[Callable] = []
@@ -196,8 +196,8 @@ class Port:
                 self._transition(State.IDLE)
             else:
                 self._transition(State.TAIL)
-                if self._pending_id_armed:
-                    self._loop.create_task(self._do_pending_id())
+                if self._anxious_id_armed:
+                    self._loop.create_task(self._do_anxious_id())
                 elif self._initial_id_pending:
                     self._initial_id_pending = False
                     self._loop.create_task(self._do_initial_id())
@@ -255,8 +255,8 @@ class Port:
         if am == "cor_ctcss" and self.state == State.ACTIVE:
             self.log.info("CTCSS idle in cor_ctcss mode → tail")
             self._transition(State.TAIL)
-            if self._pending_id_armed:
-                self._loop.create_task(self._do_pending_id())
+            if self._anxious_id_armed:
+                self._loop.create_task(self._do_anxious_id())
             elif self._initial_id_pending:
                 self._initial_id_pending = False
                 self._loop.create_task(self._do_initial_id())
@@ -284,13 +284,13 @@ class Port:
     def _schedule_id(self) -> None:
         self._cancel("id")
         self._cancel("id_sub")
-        self._pending_id_armed = False
+        self._anxious_id_armed = False
         self._voice_id_active  = False
         self._id_timer = self._loop.call_later(self.cfg.timers.id_interval, self._on_id)
-        lead = self.cfg.timers.id_pending
-        # Only arm the sub-timer if a pending_id message is actually configured,
+        lead = self.cfg.timers.id_anxious
+        # Only arm the sub-timer if an anxious_id message is actually configured,
         # and the window is narrower than the full interval.
-        if self.cfg.events.pending_id and 0 < lead < self.cfg.timers.id_interval:
+        if self.cfg.events.anxious_id and 0 < lead < self.cfg.timers.id_interval:
             self._id_sub_timer = self._loop.call_later(
                 self.cfg.timers.id_interval - lead, self._on_id_sub)
 
@@ -344,13 +344,13 @@ class Port:
 
     def _on_id_sub(self) -> None:
         self._id_sub_timer = None
-        self.log.debug("Pending ID window open — will ID at next COR drop")
-        self._pending_id_armed = True
+        self.log.debug("Anxious ID window open — will ID at next COR drop")
+        self._anxious_id_armed = True
 
     def _on_id(self) -> None:
         self._id_timer = None
         self._cancel("id_sub")
-        self._pending_id_armed = False
+        self._anxious_id_armed = False
         # Mid-transmission always counts as activity — the user is on right now.
         if self.state == State.ACTIVE:
             self._tx_activity = True
@@ -442,10 +442,10 @@ class Port:
                 self._play_message(ct)
             self._schedule_hang()
 
-    async def _do_pending_id(self) -> None:
-        """Play pending ID at the start of tail (before CT delay), reset ID cycle.
+    async def _do_anxious_id(self) -> None:
+        """Play anxious ID at the start of tail (before CT delay), reset ID cycle.
 
-        Called from _cor_idle() / _ctcss_idle() when _pending_id_armed and COR
+        Called from _cor_idle() / _ctcss_idle() when _anxious_id_armed and COR
         drops cleanly.  Plays the message, drains, resets the ID cycle as if a
         mandatory ID had just fired, then hands off to the normal CT delay.
         """
@@ -454,7 +454,7 @@ class Port:
         pre_s = self.cfg.audio.pre_message_ms / 1000.0
         if pre_s > 0:
             await asyncio.sleep(pre_s)
-        name = self.cfg.events.pending_id
+        name = self.cfg.events.anxious_id
         if name:
             self._voice_id_active = self._message_has_voice(name)
             self._play_message(name)

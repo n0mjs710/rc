@@ -53,7 +53,7 @@ class TimerConfig:
     kerchunk:    float = 0.5    # s — minimum COR hold to respond
     timeout:     float = 180.0  # s — TOT transmit cutoff
     id_interval: float = 600.0  # s — mandatory ID interval (FCC ≤ 10 min)
-    id_pending:  float = 60.0   # s — sneak pending ID this far before deadline
+    id_anxious:  float = 60.0   # s — sneak anxious ID this far before deadline
 
 
 @dataclass
@@ -62,7 +62,7 @@ class EventConfig:
     startup_message:        str  = ""
     initial_ids:            list = field(default_factory=list)
     mandatory_ids:          list = field(default_factory=list)
-    pending_id:             str  = ""   # single message; snuck in before mandatory deadline
+    anxious_id:             str  = ""   # single message; sneaked in before mandatory deadline
     impolite_id:            str  = ""   # single message; played over active QSO if deadline hit
     ct_message:             str  = ""
     timeout_message:        str  = ""
@@ -114,12 +114,12 @@ class PortConfig:
             f"  Kerchunk       : {t.kerchunk*1000:.0f} ms",
             f"  Timeout (TOT)  : {t.timeout:.0f} s",
             f"  ID interval    : {t.id_interval:.0f} s",
-            f"  ID pending     : {t.id_pending:.0f} s before deadline",
+            f"  ID anxious     : {t.id_anxious:.0f} s before deadline",
             "",
             "── Events ───────────────────────────────────",
             f"  Initial IDs    : {', '.join(self.events.initial_ids) or '(none)'}",
             f"  Mandatory IDs  : {', '.join(self.events.mandatory_ids) or '(none)'}",
-            f"  Pending ID     : {self.events.pending_id or '(none)'}",
+            f"  Anxious ID     : {self.events.anxious_id or '(none)'}",
             f"  Impolite ID    : {self.events.impolite_id or '(none)'}",
             f"  Startup msg    : {self.events.startup_message or '(none)'}",
             f"  CT message     : {self.events.ct_message or '(none)'}",
@@ -368,7 +368,7 @@ _ALIASES: list[tuple[set[str], str, str]] = [
     ({"kerchunk", "minimum"},                             "timers",   "kerchunk"),
     ({"timeout", "tot"},                                  "timers",   "timeout"),
     ({"id", "interval", "period"},                        "timers",   "id_interval"),
-    ({"id", "pending", "warn"},                           "timers",   "id_pending"),
+    ({"id", "anxious", "warn"},                           "timers",   "id_anxious"),
     # events
     ({"ct", "courtesy", "message"},                       "events",   "ct_message"),
     ({"timeout", "message"},                              "events",   "timeout_message"),
@@ -395,7 +395,7 @@ _ALIASES: list[tuple[set[str], str, str]] = [
 
 _FIELD_TYPES: dict[str, str] = {
     "hang": "time_ms", "ct_delay": "time_ms", "kerchunk": "time_ms",
-    "timeout": "time", "id_interval": "time", "id_pending": "time",
+    "timeout": "time", "id_interval": "time", "id_anxious": "time",
     "morse_wpm": "int", "morse_pitch": "int",
     "morse_level": "float", "impolite_morse_level": "float",
     "pre_message_ms": "int", "post_message_ms": "int", "ste_delay_ms": "int",
